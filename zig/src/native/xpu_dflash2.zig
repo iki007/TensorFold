@@ -38,7 +38,7 @@ pub fn Adapter(comptime M: type, comptime H: type) type {
         }
 
         fn tapsFn(_: *anyopaque) []const u32 {
-            return &H.tap_layers;
+            return H.tapLayers();
         }
 
         /// The lane target's own drafting facts before the move: a block's drafts, every stream in one batch.

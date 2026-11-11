@@ -21,7 +21,6 @@ const ST_K = q.ST_K;
 const ST_P = q.ST_P;
 const ST_Q = q.ST_Q;
 const ST_V = q.ST_V;
-const TAP_LAYERS = q.TAP_LAYERS;
 const VOCAB = q.VOCAB;
 const alloc = q.alloc;
 extern "c" fn close(fd: c_int) c_int;
@@ -340,9 +339,13 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
                 try d.launch(d.k.attn_prompt8, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0), kvCap() });
             } else if (wide) {
                 try d.launch(d.k.attn_prompt, .{ .x = (T + 7) / 8, .y = 4 }, .{ a.q, l.kc.?, l.vc.?, a.y, @as(i32, @intCast(p0)), t32, @as(f32, 1.0 / 16.0) });
+            } else if (q.attn_lk) { // XPU_ATTN_LK: a key per lane, 128-key slices, 2 subgroups per K/V head
+                const nl = (ctx + q.SPLIT_LK - 1) / q.SPLIT_LK;
+                try d.launch(if (q.kv_i8) d.k.attn_decode_lk8 else d.k.attn_decode_lk, .{ .x = T, .y = nl, .z = 4 * q.LK_PARTS }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
+                try d.launch(if (T == 1) d.k.attn_merge1_lk else d.k.attn_merge_lk, .{ .x = 24, .y = T, .z = if (T == 1) 16 else 1 }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), table, mpos });
             } else {
-                try d.launch(d.k.attn_decode, .{ .x = ns, .y = 4, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
-                try d.launch(d.k.attn_merge, .{ .x = 24, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
+                try d.launch(d.k.attn_decode, .{ .x = T, .y = ns, .z = 4 }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi != null) tree else table, mt, mpos, kvCap() });
+                try d.launch(if (T == 1) d.k.attn_merge1 else d.k.attn_merge, .{ .x = 24, .y = T, .z = if (T == 1) 16 else 1 }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
             }
             if (q.kv8 & 1 != 0) try d.launch(d.k.rot_heads, .{ .x = T, .y = 24 }, .{a.y});
             try d.launch(d.k.attn_gate, .{ .x = T }, .{ a.y, a.p, a.h, a.ahi, a.alo, gs, q.rot_on, q8oa, q8os, q8ms });
@@ -412,7 +415,7 @@ pub fn forward(d: *Dev, m: *Model, a: *Acts, ids: []const i32, p0: u32, mode: Mo
         try pgemm(d, a, act, l.down, a.r, T, false, if (act == a.p) q.rot_on else 0, q.int4_sites & 8 != 0, wide);
         if (gemm_probe) |f| try f(d, a, l.down, act, T, i, 3);
         if (p0 == 0 and i < 4) try dump(d, a, T, try std.fmt.allocPrint(alloc, "{d}", .{i}), true);
-        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i)
+        if (mode.taps) for (q.TAP_LAYERS, 0..) |tl, slot| if (tl == i)
             try d.launch(d.k.tap, .{ .x = D / 256, .y = T }, .{ a.x, a.r, a.taps, @as(i32, D), @as(i32, @intCast(slot)) });
     }
     if (!want and q.dump_h == null) { // x is per token: nothing carries to the next chunk

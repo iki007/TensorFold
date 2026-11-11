@@ -3,6 +3,7 @@ const std = @import("std");
 const q = @import("qwen27.zig");
 const dr_mod = @import("drafter.zig");
 const Drafter = dr_mod.Drafter;
+const dtree = @import("drafter_tree.zig");
 const fp64_ref = @import("fp64_ref.zig");
 
 const alloc = std.heap.c_allocator;
@@ -102,12 +103,12 @@ fn onTaps(ctx: *anyopaque, taps: *anyopaque, n: u32) !void {
     try dr.addTaps(taps, n);
 }
 
-/// Greedy decode with DFlash2 drafts (blocks of XPU_BLOCK rows, 8 by default): must equal the serial reply.
+/// Greedy decode with DFlash2 drafts (blocks of XPU_BLOCK rows, 16 by default): must equal the serial reply.
 fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u32) !void {
     const t_load = q.now();
     const dr = try Drafter.init(r, dir);
     std.debug.print("drafter loaded in {d:.1} s\n", .{q.now() - t_load});
-    const L: u32 = if (std.c.getenv("XPU_BLOCK")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 8;
+    const L: u32 = if (std.c.getenv("XPU_BLOCK")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 16;
     try r.reset();
     dr.reset();
     r.taps_on = true;
@@ -119,6 +120,8 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     q.profReport("drafter prompt (discarded)");
     var t_draft: f64 = 0;
     var t_verify: f64 = 0;
+    var phases: [4]f64 = @splat(0);
+    if (std.c.getenv("XPU_ROUND_TIMES") != null) dtree.phase_times = &phases;
     const t0 = q.now();
     const nodes: u32 = if (std.c.getenv("XPU_TREE")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 0;
     var accepted: usize = 0;
@@ -157,6 +160,10 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     const len = @min(got.items.len, serial.len);
     const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
     std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });
+    if (dtree.phase_times != null) {
+        const per = 1e3 / @as(f64, @floatFromInt(rounds));
+        std.debug.print("round phases (ms a round): lattice {d:.2}, tree {d:.2}, verify {d:.2}, commit {d:.2}\n", .{ phases[0] * per, phases[1] * per, phases[2] * per, phases[3] * per });
+    }
 }
 
 /// Can a prompt GEMM and the chunked GDN of another chunk share the card? Times each alone, chained, and unordered.

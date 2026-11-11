@@ -1,4 +1,6 @@
 //! DFlash2 drafter for the XPU runner: int4 projections on the target's GEMM, target taps as context.
+//! DSpine (config.json's dflash_config.selected_prefix_code_bridge) runs on the same path: no conv taps, causal
+//! blocks, a code bridge after every layer, and the 16 x 16 table of the refined last write instead of the selector.
 const std = @import("std");
 const ze = @import("ze");
 const kb = @import("xpu_qwen27_kernels");
@@ -14,7 +16,7 @@ const NH = 32;
 const NKV = 8;
 const HD = 128;
 const FF = 17408;
-pub const WIN = 2047; // context rows a block row sees (sliding_window − 1)
+pub var WIN: u32 = 2047; // context rows a block row sees (sliding_window − 1): DFlash2 2 047, DSpine 8 191
 const MASK_ID = 248070;
 pub const MAXL = 16; // block rows at most
 pub const MAXS = 16; // blocks (sequences) a batched lattice or absorb at most
@@ -25,6 +27,57 @@ const HEAD_N = SPAN_LO + (q.VOCAB - SPAN_HI0); // 98 592
 pub const RANK = 256;
 pub const TOPK = 16;
 pub const DEPTHS = MAXL;
+const CODE = 1024; // DSpine's code bridge: unit codes of 1 024, messages of rank 512
+const BR = 512;
+const RROWS = (MAXL - 1) * TOPK; // the refinement's rows a block: (depth, predecessor candidate)
+
+pub const Kind = enum { dflash2, dspine };
+
+/// The drafter's kind and DSpine's taps and window from `dir`/config.json (none, or no code bridge: DFlash2).
+const Config = struct { kind: Kind = .dflash2, taps: [5]usize = .{ 5, 19, 33, 47, 61 }, win: u32 = 2047 };
+
+fn readConfig(dir: []const u8) !Config {
+    const path = try std.fmt.allocPrintSentinel(alloc, "{s}/config.json", .{dir}, 0);
+    defer alloc.free(path);
+    const fd = std.c.open(path.ptr, .{});
+    if (fd < 0) return .{};
+    defer _ = std.c.close(fd);
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    var chunk: [1 << 16]u8 = undefined;
+    while (true) {
+        const got = std.c.read(fd, &chunk, chunk.len);
+        if (got < 0) return error.ReadFailed;
+        if (got == 0) break;
+        try bytes.appendSlice(alloc, chunk[0..@intCast(got)]);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes.items, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const dc = (root.get("dflash_config") orelse return .{}).object;
+    const bridge = (dc.get("selected_prefix_code_bridge") orelse return .{}).object;
+    // DSpine in the one shape this port runs (llama.cpp's converter refuses the same variants)
+    const int = struct {
+        fn f(o: std.json.ObjectMap, k: []const u8) !i64 {
+            const v = o.get(k) orelse return error.UnsupportedDSpine;
+            return if (v == .integer) v.integer else error.UnsupportedDSpine;
+        }
+    }.f;
+    if (try int(bridge, "code_size") != CODE or try int(bridge, "rank") != BR) return error.UnsupportedDSpine;
+    const causal = dc.get("draft_block_causal") orelse return error.UnsupportedDSpine;
+    if (causal != .bool or !causal.bool) return error.UnsupportedDSpine;
+    const second = (root.get("code_bridge_second_pass") orelse return error.UnsupportedDSpine).object;
+    const mode = second.get("mode") orelse return error.UnsupportedDSpine;
+    if (mode != .string or !std.mem.eql(u8, mode.string, "serial_table")) return error.UnsupportedDSpine;
+    if (try int(second, "head_topk") != TOPK or try int(second, "first_exact") != LAYERS - 1) return error.UnsupportedDSpine;
+    if (try int(root, "block_size") > MAXL or try int(root, "num_hidden_layers") != LAYERS) return error.UnsupportedDSpine;
+    var c: Config = .{ .kind = .dspine };
+    const ids = (dc.get("target_layer_ids") orelse return error.UnsupportedDSpine).array.items;
+    if (ids.len != 5) return error.UnsupportedDSpine;
+    for (ids, 0..) |v, i| c.taps[i] = @intCast(v.integer);
+    if (root.get("sliding_window")) |w| c.win = @intCast(w.integer - 1);
+    return c;
+}
 
 const Layer = struct {
     in_norm: *anyopaque,
@@ -49,13 +102,16 @@ pub const Ctx = struct {
     start: u32 = 0,
     end: u32 = 0,
 };
-const CAP = WIN + MAXL + 17; // 2 080
+fn cap() u32 { // the ring of each layer's K, V: 2 080 positions for DFlash2
+    return WIN + MAXL + 17;
+}
 
 /// One block's lattice: per depth the top 16 candidates (target ids), their logits, the selector projection.
 const Lat = struct {
     cand: [MAXL][TOPK]u32 = undefined,
     unary: [MAXL][TOPK]f64 = undefined,
     sp: [MAXL * RANK]f16 = undefined,
+    tab: [MAXL][TOPK][TOPK]f32 = undefined, // DSpine: [depth][predecessor candidate][candidate]
     depths: u32 = 0,
 };
 
@@ -69,8 +125,12 @@ const Mlx = struct { w: *anyopaque, s: *anyopaque, b: *anyopaque, n: u32 };
 
 pub const Drafter = struct {
     r: *q.Runner,
+    kind: Kind = .dflash2,
+    scale: f64 = dtree.SCALE, // the tree policy's temperature (XPU_TREE_SCALE: an experiment; DFlash2's 1.5 by default)
+    split: bool = false, // XPU_DATTN_SPLIT=1: block attention with the keys over 8 subgroups (dattn_split)
+    branch: u32 = dtree.BRANCH, // children a tree node pushes (XPU_TREE_BRANCH 1 .. 4: an experiment; 1 is a greedy chain)
     ckpt: q.Checkpoint = .{}, // the codebooks (pred, succ) are read from its mapping
-    k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
+    k: struct { dconv: ze.H, dprep: ze.H, dattn: ze.H, dattn_split: ze.H, rowsums_rows: ze.H, taps_in: ze.H, to_res: ze.H, topk_part: ze.H, quantize4: ze.H },
     layers: [LAYERS]Layer,
     fc: q.Proj,
     hidden_norm: *anyopaque,
@@ -87,6 +147,8 @@ pub const Drafter = struct {
     unary: [MAXL][TOPK]f64 = undefined,
     sp: [MAXL * RANK]f16 = undefined,
     depths: u32 = 0,
+    tab: [MAXL][TOPK][TOPK]f32 = undefined, // DSpine's table of the last block
+    rank: [MAXL]u8 = undefined, // the last tree's nodes: each one's place in the best-first order
     multi: [MAXS]Lat = undefined, // a batched lattice's blocks (take() makes one the current)
     rows_host: [MAXB][4]i32 = undefined, // a batched pass's rows: position, context start, block start, block
     ptrs_host: [LAYERS][MAXS][2]u64 = undefined, // and each block's K, V caches by layer
@@ -112,6 +174,32 @@ pub const Drafter = struct {
     pi: *anyopaque,
     ids: *anyopaque,
     pscr: *anyopaque,
+    // DSpine: the code bridge (bf16), its kernels and buffers (fp32), the refinement's ids and table
+    dk: struct { add: ze.H, norm: ze.H, mm: ze.H, codes: ze.H, msg: ze.H, write: ze.H, pred: ze.H, rmsg: ze.H, refine: ze.H, headdot: ze.H } = undefined,
+    cb: *anyopaque = undefined, // codebook [vocab, CODE]
+    bread: [LAYERS]*anyopaque = undefined, // [CODE, D]
+    bwrite: [LAYERS]*anyopaque = undefined, // [D, BR]
+    wqsv: *anyopaque = undefined, // [3 BR, CODE]: gate, predecessor gate, prev
+    gb: *anyopaque = undefined, // gate bias [BR]
+    bn: *anyopaque = undefined, // [MAXB, D] each row normed (the read's input)
+    brms: *anyopaque = undefined, // [MAXB] each row's RMS (the write's scale); the last layer's kept
+    bcr: *anyopaque = undefined, // [MAXB, CODE] the read
+    bcodes: *anyopaque = undefined, // [MAXB, CODE]
+    bqsv: *anyopaque = undefined, // [MAXB, 3 BR]; the last layer's kept
+    bmsg: *anyopaque = undefined, // [MAXB, BR]
+    bdelta: *anyopaque = undefined, // [MAXB, D]
+    braw: *anyopaque = undefined, // [MAXB, D] x before the last write
+    rpids: *anyopaque = undefined, // [MAXS, RROWS] predecessor tokens
+    ridx: *anyopaque = undefined, // [MAXS, RROWS] candidates' head columns
+    rpred: *anyopaque = undefined, // [RROWS, CODE]
+    rsv: *anyopaque = undefined, // [RROWS, 2 BR]
+    rmsg: *anyopaque = undefined, // [RROWS, BR]
+    rdelta: *anyopaque = undefined, // [RROWS, D]
+    rx: *anyopaque = undefined, // [RROWS, D]
+    rtab: *anyopaque = undefined, // [MAXS, RROWS, TOPK]
+    pids_host: [MAXS * RROWS]i32 = undefined,
+    idx_host: [MAXS * RROWS]i32 = undefined,
+    tab_host: [MAXS * RROWS * TOPK]f32 = undefined,
 
     fn pack(d: *q.Dev, parts: []const Mlx, k: u32, wide: bool) !q.Proj {
         var n_real: u32 = 0;
@@ -165,6 +253,10 @@ pub const Drafter = struct {
         const path = try std.fmt.allocPrintSentinel(alloc, "{s}/model.safetensors", .{dir}, 0);
         defer alloc.free(path);
         try c.addShard(path);
+        const cfg = try readConfig(dir);
+        WIN = cfg.win; // before any context is allocated (use(0) below)
+        q.TAP_LAYERS = cfg.taps; // the target's rows the drafter reads, from its next forward on
+        const dspine = cfg.kind == .dspine;
         const dr = try alloc.create(Drafter);
         errdefer alloc.destroy(dr);
         const m = try d.g.module(&kb.drafter);
@@ -180,7 +272,11 @@ pub const Drafter = struct {
         errdefer alloc.free(pi_host);
         dr.* = .{
             .r = r,
-            .k = .{ .dconv = try kern(d, m, "dconv", 512), .dprep = try kern(d, m, "dprep", 16), .dattn = try kern(d, m, "dattn", 16), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .topk_part = try kern(d, m, "topk_part", 16), .quantize4 = try kern(d, m, "quantize4", 16) },
+            .kind = cfg.kind,
+            .scale = if (std.c.getenv("XPU_TREE_SCALE")) |v| try std.fmt.parseFloat(f64, std.mem.span(v)) else dtree.SCALE,
+            .split = if (std.c.getenv("XPU_DATTN_SPLIT")) |v| v[0] == '1' else false,
+            .branch = if (std.c.getenv("XPU_TREE_BRANCH")) |v| std.math.clamp(try std.fmt.parseInt(u32, std.mem.span(v), 10), 1, dtree.BRANCH) else dtree.BRANCH,
+            .k = .{ .dconv = try kern(d, m, "dconv", 512), .dprep = try kern(d, m, "dprep", 16), .dattn = try kern(d, m, "dattn", 16), .dattn_split = try kern(d, m, "dattn_split", 128), .rowsums_rows = try kern(d, m, "rowsums_rows", 256), .taps_in = try kern(d, m, "taps_in", 256), .to_res = try kern(d, m, "to_res", 256), .topk_part = try kern(d, m, "topk_part", 16), .quantize4 = try kern(d, m, "quantize4", 16) },
             .layers = undefined,
             .fc = undefined,
             .hidden_norm = undefined,
@@ -188,8 +284,8 @@ pub const Drafter = struct {
             .sel = undefined,
             .head = undefined,
             .invf = undefined,
-            .pred = (try c.get("candidate_selector.predecessor_codebook")).bytes,
-            .succ = (try c.get("candidate_selector.successor_codebook")).bytes,
+            .pred = if (dspine) &.{} else (try c.get("candidate_selector.predecessor_codebook")).bytes,
+            .succ = if (dspine) &.{} else (try c.get("candidate_selector.successor_codebook")).bytes,
             .x = try d.alloc_(rows * D * 4),
             .h = try d.alloc_(rows * 25600 * 2),
             .h2 = try d.alloc_(MAXB * FF * 2),
@@ -228,19 +324,19 @@ pub const Drafter = struct {
         dr.fc = try dr.quantized(&c, &.{"fc.weight"}, false, stage);
         dr.hidden_norm = try bf(d, &c, "hidden_norm.weight");
         dr.norm = try bf(d, &c, "norm.weight");
-        dr.sel = try dr.quantized(&c, &.{"candidate_selector.hidden_projection.weight"}, false, stage);
+        if (!dspine) dr.sel = try dr.quantized(&c, &.{"candidate_selector.hidden_projection.weight"}, false, stage);
         for (&dr.layers, 0..) |*l, i| l.* = .{
             .in_norm = try bf(d, &c, nm(i, "input_layernorm.weight")),
             .post_norm = try bf(d, &c, nm(i, "post_attention_layernorm.weight")),
-            .kp_attn = try dr.quantized(&c, &.{nm(i, "attention_conv.kernel_projection.weight")}, false, stage),
-            .base_attn = try bf(d, &c, nm(i, "attention_conv.base_kernel")),
+            .kp_attn = if (dspine) undefined else try dr.quantized(&c, &.{nm(i, "attention_conv.kernel_projection.weight")}, false, stage),
+            .base_attn = if (dspine) undefined else try bf(d, &c, nm(i, "attention_conv.base_kernel")),
             .qkv = try dr.quantized(&c, &.{ nm(i, "self_attn.q_proj.weight"), nm(i, "self_attn.k_proj.weight"), nm(i, "self_attn.v_proj.weight") }, false, stage),
             .kv = try dr.quantized(&c, &.{ nm(i, "self_attn.k_proj.weight"), nm(i, "self_attn.v_proj.weight") }, false, stage),
             .qn = try bf(d, &c, nm(i, "self_attn.q_norm.weight")),
             .kn = try bf(d, &c, nm(i, "self_attn.k_norm.weight")),
             .o = try dr.quantized(&c, &.{nm(i, "self_attn.o_proj.weight")}, false, stage),
-            .kp_mlp = try dr.quantized(&c, &.{nm(i, "mlp_conv.kernel_projection.weight")}, false, stage),
-            .base_mlp = try bf(d, &c, nm(i, "mlp_conv.base_kernel")),
+            .kp_mlp = if (dspine) undefined else try dr.quantized(&c, &.{nm(i, "mlp_conv.kernel_projection.weight")}, false, stage),
+            .base_mlp = if (dspine) undefined else try bf(d, &c, nm(i, "mlp_conv.base_kernel")),
             .gu = try dr.quantized(&c, &.{ nm(i, "mlp.gate_proj.weight"), nm(i, "mlp.up_proj.weight") }, true, stage),
             .down = try dr.quantized(&c, &.{nm(i, "mlp.down_proj.weight")}, false, stage),
         };
@@ -298,11 +394,69 @@ pub const Drafter = struct {
             dr.head = try pack(d, &parts, kk, true);
         }
         dr.logits = try d.alloc_(MAXB * @as(usize, dr.head.n) * 2);
+        if (dspine) try dr.initBridge(&c, m);
         var invf: [64]f32 = undefined;
         for (&invf, 0..) |*f, i| f.* = @floatCast(1.0 / std.math.pow(f64, 1e7, @as(f64, @floatFromInt(2 * i)) / 128.0));
         dr.invf = try d.upload(std.mem.sliceAsBytes(&invf));
+        if (q.prof.on) { // XPU_PROFILE: the drafter's kernels by name, after the runner's
+            var at: usize = 0;
+            while (at < q.prof.names.len and q.prof.names[at].k != null) at += 1;
+            inline for (@typeInfo(@TypeOf(dr.k)).@"struct".field_names) |name| if (at < q.prof.names.len) {
+                q.prof.names[at] = .{ .k = @field(dr.k, name), .name = name };
+                at += 1;
+            };
+            if (dspine) inline for (@typeInfo(@TypeOf(dr.dk)).@"struct".field_names) |name| if (at < q.prof.names.len) {
+                q.prof.names[at] = .{ .k = @field(dr.dk, name), .name = "dsp_" ++ name };
+                at += 1;
+            };
+        }
         try dr.use(0);
         return dr;
+    }
+
+    /// DSpine's code bridge: bf16 weights as the checkpoint has them (the reference GGUF keeps them unquantized too),
+    /// the kernels and the buffers of a pass and of the refinement.
+    fn initBridge(dr: *Drafter, c: *const q.Checkpoint, m: ze.H) !void {
+        const d = &dr.r.d;
+        const kern = struct {
+            fn f(dd: *q.Dev, mm: ze.H, name: [*:0]const u8, local: u32) !ze.H {
+                return dd.kernel(mm, name, local);
+            }
+        }.f;
+        dr.dk = .{ .add = try kern(d, m, "dsp_add", 256), .norm = try kern(d, m, "dsp_norm", 256), .mm = try kern(d, m, "dsp_mm", 256), .codes = try kern(d, m, "dsp_codes", 256), .msg = try kern(d, m, "dsp_msg", 256), .write = try kern(d, m, "dsp_write", 256), .pred = try kern(d, m, "dsp_pred", 256), .rmsg = try kern(d, m, "dsp_rmsg", 256), .refine = try kern(d, m, "dsp_refine", 256), .headdot = try kern(d, m, "dsp_headdot", 256) };
+        const B = "selected_prefix_bridge.";
+        const cb = try c.get(B ++ "codebook");
+        if (cb.shape[1] != CODE) return error.UnsupportedDSpine;
+        dr.cb = try d.upload(cb.bytes);
+        const early = try c.get(B ++ "early_read_weights"); // [LAYERS - 1, CODE, D]; the last layer reads with read_weight
+        const per_read = @as(usize, CODE) * D * 2;
+        for (0..LAYERS - 1) |i| dr.bread[i] = try d.upload(early.bytes[i * per_read ..][0..per_read]);
+        dr.bread[LAYERS - 1] = try d.upload((try c.get(B ++ "read_weight")).bytes);
+        const writes = try c.get(B ++ "feature_write_weights"); // [LAYERS, D, BR]
+        const per_write = @as(usize, D) * BR * 2;
+        for (0..LAYERS) |i| dr.bwrite[i] = try d.upload(writes.bytes[i * per_write ..][0..per_write]);
+        const qsv = try alloc.alloc(u8, 3 * BR * CODE * 2); // gate | predecessor gate | prev: one pass for all three
+        defer alloc.free(qsv);
+        for ([_][]const u8{ B ++ "gate.weight", B ++ "predecessor_gate.weight", B ++ "prev.weight" }, 0..) |name, i|
+            @memcpy(qsv[i * BR * CODE * 2 ..][0 .. BR * CODE * 2], (try c.get(name)).bytes);
+        dr.wqsv = try d.upload(qsv);
+        dr.gb = try d.upload((try c.get(B ++ "gate.bias")).bytes);
+        dr.bn = try d.alloc_(MAXB * D * 4);
+        dr.brms = try d.alloc_(MAXB * 4);
+        dr.bcr = try d.alloc_(MAXB * CODE * 4);
+        dr.bcodes = try d.alloc_(MAXB * CODE * 4);
+        dr.bqsv = try d.alloc_(MAXB * 3 * BR * 4);
+        dr.bmsg = try d.alloc_(MAXB * BR * 4);
+        dr.bdelta = try d.alloc_(MAXB * D * 4);
+        dr.braw = try d.alloc_(MAXB * D * 4);
+        dr.rpids = try d.alloc_(MAXS * RROWS * 4);
+        dr.ridx = try d.alloc_(MAXS * RROWS * 4);
+        dr.rpred = try d.alloc_(RROWS * CODE * 4);
+        dr.rsv = try d.alloc_(RROWS * 2 * BR * 4);
+        dr.rmsg = try d.alloc_(RROWS * BR * 4);
+        dr.rdelta = try d.alloc_(RROWS * D * 4);
+        dr.rx = try d.alloc_(RROWS * D * 4);
+        dr.rtab = try d.alloc_(MAXS * RROWS * TOPK * 4);
     }
 
     /// Frees the host side; the device buffers go with the runner's device (Runner.deinit), after this.
@@ -321,8 +475,8 @@ pub const Drafter = struct {
             const d = &dr.r.d;
             var x: Ctx = undefined;
             for (&x.kc, &x.vc) |*k, *v| {
-                k.* = try d.alloc_(@as(usize, NKV) * CAP * HD * 2);
-                v.* = try d.alloc_(@as(usize, NKV) * CAP * HD * 2);
+                k.* = try d.alloc_(@as(usize, NKV) * cap() * HD * 2);
+                v.* = try d.alloc_(@as(usize, NKV) * cap() * HD * 2);
             }
             x.start = 0;
             x.end = 0;
@@ -337,14 +491,14 @@ pub const Drafter = struct {
 
     /// A slot context's bytes (its K and V rings).
     pub fn ctxBytes() usize {
-        return LAYERS * 2 * @as(usize, NKV) * CAP * HD * 2;
+        return LAYERS * 2 * @as(usize, NKV) * cap() * HD * 2;
     }
 
     /// Copies `slot`'s context into `dst` (ctxBytes); its start and end.
     pub fn saveCtx(dr: *Drafter, slot: u32, dst: *anyopaque) ![2]u32 {
         try dr.use(slot);
         const c = dr.ctx();
-        const n = @as(usize, NKV) * CAP * HD * 2;
+        const n = @as(usize, NKV) * cap() * HD * 2;
         for (c.kc, c.vc, 0..) |k, v, i| {
             try q.copy(&dr.r.d, q.off(dst, (2 * i) * n), k, n);
             try q.copy(&dr.r.d, q.off(dst, (2 * i + 1) * n), v, n);
@@ -356,7 +510,7 @@ pub const Drafter = struct {
     pub fn restoreCtx(dr: *Drafter, slot: u32, src: *anyopaque, range: [2]u32) !void {
         try dr.use(slot);
         const c = dr.ctx();
-        const n = @as(usize, NKV) * CAP * HD * 2;
+        const n = @as(usize, NKV) * cap() * HD * 2;
         for (c.kc, c.vc, 0..) |k, v, i| {
             try q.copy(&dr.r.d, k, q.off(src, (2 * i) * n), n);
             try q.copy(&dr.r.d, v, q.off(src, (2 * i + 1) * n), n);
@@ -399,7 +553,7 @@ pub const Drafter = struct {
             const c = dr.ctx();
             for (&dr.layers, c.kc, c.vc) |*l, kc, vc| {
                 try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kv, dr.p, rows);
-                try d.launch(dr.k.dprep, .{ .x = rows, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), @as(i32, @intCast(base + done)), HIDDEN_NORM_EPS, nul, nul });
+                try d.launch(dr.k.dprep, .{ .x = rows, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, @intCast(cap())), @as(i32, @intCast(base + done)), HIDDEN_NORM_EPS, nul, nul });
             }
             done += rows;
         }
@@ -437,6 +591,7 @@ pub const Drafter = struct {
         dr.cand = x.cand;
         dr.unary = x.unary;
         dr.sp = x.sp;
+        if (dr.kind == .dspine) dr.tab = x.tab;
         dr.depths = x.depths;
     }
 
@@ -468,7 +623,7 @@ pub const Drafter = struct {
         try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, dr.hidden_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
         for (&dr.layers, 0..) |*l, li| {
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kv, dr.p, R);
-            try d.launch(dr.k.dprep, .{ .x = R, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, dr.ptrs_host[li][0][0], dr.ptrs_host[li][0][1], @as(i32, CAP), @as(i32, 0), HIDDEN_NORM_EPS, dr.rows_dev, q.off(dr.ptrs_dev, li * MAXS * 16) });
+            try d.launch(dr.k.dprep, .{ .x = R, .y = 16 }, .{ dr.p, @as(i32, @intCast(l.kv.n)), @as(i32, -1), l.qn, l.kn, dr.invf, dr.qb, dr.ptrs_host[li][0][0], dr.ptrs_host[li][0][1], @as(i32, @intCast(cap())), @as(i32, 0), HIDDEN_NORM_EPS, dr.rows_dev, q.off(dr.ptrs_dev, li * MAXS * 16) });
         }
         for (items) |it| {
             try dr.use(it.slot);
@@ -515,12 +670,27 @@ pub const Drafter = struct {
         const c0: i32 = @intCast(@max(c.end -| WIN, c.start));
         for (&dr.layers, c.kc, c.vc, 0..) |*l, kc, vc, li| {
             const ptrs_t: ?*anyopaque = if (one) nul else q.off(dr.ptrs_dev, li * MAXS * 16);
+            if (dr.kind == .dspine) { // no conv taps: plain residual adds, causal block attention, then the bridge write
+                try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
+                try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.qkv, dr.p, R);
+                try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, @intCast(cap())), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
+                try d.launch(if (dr.split) dr.k.dattn_split else dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, @intCast(cap())), c0, end_, l32, @as(i32, @intCast(WIN)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t, @as(i32, 1) });
+                try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
+                try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
+                try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.post_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 1), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
+                try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.gu, dr.p, R);
+                try d.launch(d.k.swiglu, .{ .x = R, .y = 17 }, .{ dr.p, dr.h2, dr.ahi, dr.alo, @as(i32, GS), @as(i32, 0), @as(i32, 0) });
+                try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.down, dr.r16, R);
+                try d.launch(dr.dk.add, .{ .x = R * D / 256 }, .{ dr.x, dr.r16 });
+                try dr.bridge(li, R, L);
+                continue;
+            }
             try d.launch(d.k.add_rmsnorm, .{ .x = R }, .{ dr.x, dr.r16, l.in_norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
             try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, l.kp_attn, dr.dyn, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.h, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 0), dr.x, @as(i32, 0), dr.h2, dr.ahi, dr.alo, l32 });
             try q.gemm(d, dr.pscr, dr.h2, dr.ahi, dr.alo, l.qkv, dr.p, R);
-            try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, CAP), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
-            try d.launch(dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, CAP), c0, end_, l32, @as(i32, WIN), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t });
+            try d.launch(dr.k.dprep, .{ .x = R, .y = 48 }, .{ dr.p, @as(i32, @intCast(l.qkv.n)), @as(i32, 0), l.qn, l.kn, dr.invf, dr.qb, kc, vc, @as(i32, @intCast(cap())), end_, HIDDEN_NORM_EPS, rows_t, ptrs_t });
+            try d.launch(if (dr.split) dr.k.dattn_split else dr.k.dattn, .{ .x = R, .y = NKV }, .{ dr.qb, kc, vc, @as(i32, @intCast(cap())), c0, end_, l32, @as(i32, @intCast(WIN)), @as(f32, 1.0 / @sqrt(@as(f32, HD))), dr.o, rows_t, ptrs_t, @as(i32, 0) });
             try d.launch(dr.k.rowsums_rows, .{ .x = R }, .{ dr.o, @as(i32, NH * HD), dr.ahi, dr.alo });
             try q.gemm(d, dr.pscr, dr.o, dr.ahi, dr.alo, l.o, dr.r16, R);
             try d.launch(dr.k.dconv, .{ .x = R, .y = D / 512 }, .{ dr.r16, dr.dyn, @as(i32, @intCast(l.kp_attn.n)), l.base_attn, @as(i32, 1), dr.x, @as(i32, 1), dr.h2, dr.ahi, dr.alo, l32 });
@@ -536,7 +706,7 @@ pub const Drafter = struct {
         const first: u32 = if (one) 1 else 0;
         const rows = if (one) count else R;
         try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ q.off(dr.x, first * D * 4), dr.r16, dr.norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
-        try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.sel, dr.selp, rows);
+        if (dr.kind == .dflash2) try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.sel, dr.selp, rows);
         try q.gemm(d, dr.pscr, dr.h, dr.ahi, dr.alo, dr.head, dr.logits, rows);
         try d.launch(dr.k.topk_part, .{ .x = 256, .y = rows }, .{ dr.logits, @as(i32, HEAD_N), @as(i32, @intCast(dr.head.n)), dr.pv, dr.pi });
         const pv = dr.pv_host;
@@ -544,7 +714,7 @@ pub const Drafter = struct {
         var sp: [MAXB * RANK]f16 = undefined;
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pv.ptr, dr.pv, rows * 256 * 16 * 4, null, 0, null));
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, pi.ptr, dr.pi, rows * 256 * 16 * 4, null, 0, null));
-        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
+        if (dr.kind == .dflash2) try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &sp, dr.selp, rows * RANK * 2, null, 0, null));
         try d.sync();
         for (0..S) |b| {
             const x = &dr.multi[b];
@@ -570,9 +740,63 @@ pub const Drafter = struct {
                     x.cand[depth][j] = if (local < SPAN_LO) local else SPAN_HI0 + (local - SPAN_LO);
                     x.unary[depth][j] = bv[j];
                 }
-                @memcpy(x.sp[depth * RANK ..][0..RANK], sp[row * RANK ..][0..RANK]);
+                if (dr.kind == .dflash2) @memcpy(x.sp[depth * RANK ..][0..RANK], sp[row * RANK ..][0..RANK]);
             }
             x.depths = count;
+        }
+        if (dr.kind == .dspine) try dr.refine(items, L, count);
+    }
+
+    /// DSpine's code bridge write after layer `li` on the pass's R rows (blocks of L): read each row's code (a block's
+    /// row 0 its token's), gate the previous row's message, write it back scaled by the row's RMS. The last layer
+    /// keeps x before its write, its RMS and its gate projections for the refinement.
+    fn bridge(dr: *Drafter, li: usize, R: u32, L: u32) !void {
+        const d = &dr.r.d;
+        const rr: i32 = @intCast(R);
+        const nul: ?*anyopaque = null;
+        try d.launch(dr.dk.norm, .{ .x = R }, .{ dr.x, HIDDEN_NORM_EPS, dr.bn, dr.brms });
+        try d.launch(dr.dk.mm, .{ .x = CODE / 16, .y = (R + 15) / 16 }, .{ dr.bn, @as(i32, D), dr.bread[li], @as(i32, D), dr.bcr, @as(i32, CODE), rr });
+        try d.launch(dr.dk.codes, .{ .x = R }, .{ dr.bcr, dr.ids, @as(i32, @intCast(L)), dr.cb, HIDDEN_NORM_EPS, dr.bcodes });
+        try d.launch(dr.dk.mm, .{ .x = 3 * BR / 16, .y = (R + 15) / 16 }, .{ dr.bcodes, @as(i32, CODE), dr.wqsv, @as(i32, CODE), dr.bqsv, @as(i32, 3 * BR), rr });
+        try d.launch(dr.dk.msg, .{ .x = R * BR / 256 }, .{ dr.bqsv, dr.gb, @as(i32, @intCast(L)), dr.bmsg });
+        try d.launch(dr.dk.mm, .{ .x = D / 16, .y = (R + 15) / 16 }, .{ dr.bmsg, @as(i32, BR), dr.bwrite[li], @as(i32, BR), dr.bdelta, @as(i32, D), rr });
+        try d.launch(dr.dk.write, .{ .x = R * D / 256 }, .{ dr.x, dr.bdelta, dr.brms, if (li == LAYERS - 1) dr.braw else nul });
+    }
+
+    /// DSpine's table per block: the last write redone with each depth's exact predecessor (the anchor at depth 0,
+    /// else each of the previous depth's 16 candidates), normed, and scored on this depth's 16 candidates.
+    fn refine(dr: *Drafter, items: []const Block, L: u32, count: u32) !void {
+        const d = &dr.r.d;
+        const rows = count * TOPK;
+        const S = items.len;
+        for (items, 0..) |it, b| {
+            const x = &dr.multi[b];
+            for (0..count) |dd| for (0..TOPK) |j| {
+                dr.pids_host[b * RROWS + dd * TOPK + j] = @intCast(if (dd == 0) it.pending else x.cand[dd - 1][j]);
+                const tok = x.cand[dd][j];
+                dr.idx_host[b * RROWS + dd * TOPK + j] = @intCast(if (tok < SPAN_LO) tok else SPAN_LO + (tok - SPAN_HI0));
+            };
+        }
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.rpids, &dr.pids_host, S * RROWS * 4, null, 0, null));
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, dr.ridx, &dr.idx_host, S * RROWS * 4, null, 0, null));
+        const nrows: i32 = @intCast(rows);
+        for (0..S) |b| {
+            const row0: i32 = @intCast(b * L); // the block's row 0 among the pass's rows (raw, rms, gate projections)
+            try d.launch(dr.dk.pred, .{ .x = rows * CODE / 256 }, .{ q.off(dr.rpids, b * RROWS * 4), dr.cb, dr.rpred });
+            try d.launch(dr.dk.mm, .{ .x = 2 * BR / 16, .y = (rows + 15) / 16 }, .{ dr.rpred, @as(i32, CODE), q.off(dr.wqsv, BR * CODE * 2), @as(i32, CODE), dr.rsv, @as(i32, 2 * BR), nrows });
+            try d.launch(dr.dk.rmsg, .{ .x = rows * BR / 256 }, .{ dr.rsv, dr.bqsv, row0, dr.gb, dr.rmsg });
+            try d.launch(dr.dk.mm, .{ .x = D / 16, .y = (rows + 15) / 16 }, .{ dr.rmsg, @as(i32, BR), dr.bwrite[LAYERS - 1], @as(i32, BR), dr.rdelta, @as(i32, D), nrows });
+            try d.launch(dr.dk.refine, .{ .x = rows * D / 256 }, .{ dr.braw, dr.brms, row0, dr.rdelta, dr.rx });
+            try d.launch(d.k.add_rmsnorm, .{ .x = rows }, .{ dr.rx, dr.r16, dr.norm, dr.h, dr.ahi, dr.alo, @as(i32, D), HIDDEN_NORM_EPS, @as(i32, 0), @as(i32, GS), q.no_q8, q.no_q8, @as(i32, 0), @as(i32, 0) });
+            try d.launch(dr.dk.headdot, .{ .x = rows }, .{ dr.h, dr.ahi, dr.alo, dr.head.w, dr.head.s, dr.head.bg, @as(i32, @intCast(dr.head.n)), q.off(dr.ridx, b * RROWS * 4), q.off(dr.rtab, b * RROWS * TOPK * 4) });
+        }
+        try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, &dr.tab_host, dr.rtab, S * RROWS * TOPK * 4, null, 0, null));
+        try d.sync();
+        for (0..S) |b| {
+            const x = &dr.multi[b];
+            for (0..count) |dd| for (0..TOPK) |j| for (0..TOPK) |k| {
+                x.tab[dd][j][k] = dr.tab_host[b * RROWS * TOPK + (dd * TOPK + j) * TOPK + k];
+            };
         }
     }
 };
@@ -580,3 +804,4 @@ pub const Drafter = struct {
 pub const Draw = dtree.Draw;
 pub const Round = dtree.Round;
 pub const treeRound = dtree.treeRound;
+pub const chainRound = dtree.chainRound;

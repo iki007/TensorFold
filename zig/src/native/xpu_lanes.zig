@@ -4,6 +4,8 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const xq = @import("xpu_qwen27");
 const be = lanes.backend;
+const tree_pick = @import("xpu_tree_pick.zig");
+const copy = @import("xpu_copy.zig");
 const Drafter = xq.drafter.Drafter;
 const Allocator = std.mem.Allocator;
 
@@ -20,8 +22,9 @@ pub const Lanes = struct {
     pick: *const fn (ctx: *anyopaque, row: []const f32, position: u64, s: api.Sampling) anyerror!u32,
     pick_ctx: *anyopaque,
     slots: u32,
-    block: u32 = 8,
+    block: u32 = 16, // drafter block rows; DFlash2 is trained on 8, the deeper rows still raise acceptance
     nodes: u32 = 15,
+    adapt: bool = true, // the lone stream's tree size chosen each round, at most `nodes` (XPU_TREE fixes it)
     owners: [xq.MAX_SLOTS]?*lanes.Stream = @splat(null),
     first_logits: [xq.MAX_SLOTS]?[]f32 = @splat(null), // a sampled or structured stream's prompt-row logits, for `first`
     mask_rows: [16]u32 = undefined, // a verify's greedy structured rows (argmaxMasked on the device)
@@ -47,11 +50,13 @@ pub const Lanes = struct {
     pub const max_slots = xq.MAX_SLOTS;
     pub const tap_row = TAP_ROW;
     pub const draft_step_ms = 0.6; // a DFlash2 draft pass's ms, as the round loop prices it
-    pub const tap_layers = blk: {
-        var t: [xq.TAP_LAYERS.len]u32 = undefined;
-        for (xq.TAP_LAYERS, &t) |l, *x| x.* = l;
-        break :blk t;
-    };
+    var tap_buf: [xq.TAP_LAYERS.len]u32 = undefined;
+    /// The drafter's target layers as they are now: a drafter that reads other layers (DSpine) sets xq.TAP_LAYERS when
+    /// it loads, so these are read at call time rather than fixed at build time.
+    pub fn tapLayers() []const u32 {
+        for (xq.TAP_LAYERS, &tap_buf) |l, *x| x.* = @intCast(l);
+        return &tap_buf;
+    }
     /// Rows [start, start + rows) of a prompt pass in `slot`, their taps in acts.taps.
     pub const Tail = struct { slot: u32, start: u64, rows: u32 };
 
@@ -458,6 +463,10 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const b = self(ptr);
         b.settle() catch {};
+        if (std.c.getenv("XPU_PROFILE") != null) { // local diagnostic: GPU time per kernel since the last release
+            b.runner.d.sync() catch {};
+            xq.profReport("server, since the last release");
+        }
         const slot = b.slotOf(s) orelse return;
         b.owners[slot] = null;
     }
@@ -513,6 +522,18 @@ pub const Lanes = struct {
         try d.use(slot);
         var pending = pending0;
         var out: [16]u32 = undefined;
+        var pick: tree_pick.Pick = .{};
+        var ms: [16]f64 = undefined;
+        for (&ms, b.costs) |*m, c| m.* = c.ms;
+        // XPU_COPY=1: a round whose context's last 12 tokens occurred before verifies what followed them (no drafter
+        // pass); XPU_COPY_LOG=1 prints the stream's copy rounds at its end
+        const copying = std.c.getenv("XPU_COPY") != null;
+        var cx: copy.Index = .{};
+        defer cx.deinit(b.gpa);
+        var copy_rounds: u64 = 0;
+        var copy_kept: u64 = 0;
+        defer if (copying and std.c.getenv("XPU_COPY_LOG") != null)
+            std.debug.print("xpu copy: {d} rounds, {d} of them copies keeping {d} drafts\n", .{ s.rounds, copy_rounds, copy_kept });
         while (!s.finished) {
             if (hooks.yield(hooks.ctx)) {
                 s.cache_len = r.pos;
@@ -525,7 +546,30 @@ pub const Lanes = struct {
             defer r.taps_on = false;
             var sampled: Sampled = .{ .b = b, .s = s.sampling orelse .{ .seed = 0 } };
             const drawer: ?xq.drafter.Draw = if (s.sampling) |sp| .{ .ctx = &sampled, .row = Sampled.row, .gumbel = Sampled.gumbel, .temperature = sp.temperature } else null;
-            const round = try xq.drafter.treeRound(d, pending, b.block - 1, b.nodes, drawer, &out);
+            const pos = r.pos;
+            var copied: [16]u32 = undefined;
+            var n_copy: usize = 0;
+            const h = s.context.items;
+            if (copying and h.len > 0 and h[h.len - 1] == pending) {
+                try cx.extend(b.gpa, h);
+                const prop = cx.propose(h, b.block - 1);
+                if (prop.len >= 4) { // a shorter run keeps fewer tokens than a DFlash2 tree
+                    @memcpy(copied[0..prop.len], prop);
+                    n_copy = prop.len;
+                }
+            }
+            const round = if (n_copy > 0) blk: {
+                const rc = try xq.drafter.chainRound(d, pending, copied[0..n_copy], drawer, &out);
+                copy_rounds += 1;
+                copy_kept += rc.accepted;
+                break :blk rc;
+            } else blk: {
+                const nodes = if (b.adapt) pick.choose(ms[0..b.timed], pos, b.nodes) else b.nodes;
+                const t0 = xq.now();
+                const rt = try xq.drafter.treeRound(d, pending, b.block - 1, nodes, drawer, &out);
+                if (b.adapt) pick.learn(nodes, &rt.kept, rt.verify_s, xq.now() - t0, ms[0..b.timed], pos);
+                break :blk rt;
+            };
             s.rounds += 1;
             s.drafted += round.drafted;
             s.accepted += round.accepted;

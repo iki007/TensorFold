@@ -72,17 +72,18 @@ KERNEL(16) void gdn_step(global const ushort *Q, global const ushort *K, global 
       for (int i = 0; i < 8; i++) SO[((long)h * 128 + vb * 8 + r) * 128 + i * 16 + lane] = s[r][i];
 }
 
-// Decode attention by key slices: one subgroup per (slice, K/V head, query part, row). Grid y is AKV * QPARTS.
+// Decode attention by key slices: a subgroup per (row, slice, K/V head, query part) handles Q27_QPG query heads;
+// partials PM, PL, PO. Grid (rows, slices, Q27_AKV * Q27_QPARTS): rows first, so a slice's K/V is shared via L2.
 #define SPLIT 32
 KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,
                             global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,
                             global const ulong *MT, global const int *POS, int cap) {
   // MT (if non-null): several streams, one row each; with TREE, tree windows; cap > 0: int8 cache (256 bytes per row).
 #if Q27_QPARTS == 1
-  const int sp = get_group_id(0), hk = get_group_id(1), t = get_group_id(2), lane = get_sub_group_local_id();
+  const int t = get_group_id(0), sp = get_group_id(1), hk = get_group_id(2), lane = get_sub_group_local_id();
 #else
-  const int sp = get_group_id(0), hk = get_group_id(1) / Q27_QPARTS, t = get_group_id(2), lane = get_sub_group_local_id();
-  const int qh0 = hk * Q27_GQA + (get_group_id(1) % Q27_QPARTS) * Q27_QPG; // the first query head held
+  const int t = get_group_id(0), sp = get_group_id(1), hk = get_group_id(2) / Q27_QPARTS, lane = get_sub_group_local_id();
+  const int qh0 = hk * Q27_GQA + (get_group_id(2) % Q27_QPARTS) * Q27_QPG; // the first query head held
 #endif
   int base = p0, wf = 0;
   if (MT) {
@@ -148,22 +149,179 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
   }
 }
 
-// Merge of the slices, in order: O bf16 [T, Q27_AQ, 256]. One subgroup per (head, row).
-KERNEL(16) void attn_merge(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
-                           int p0, int NS, global const int *TREE, global const int *POS) {
+// XPU_ATTN_LK=1 (local option): decode attention with a key per lane. A subgroup per (row, slice of SPLIT_LK keys,
+// K/V head, query part) handles LK_QPG query heads, 16 keys a step: each lane's scores are dots along its own key (the query dims
+// broadcast from the lanes that hold them), one max and two exps per head a step instead of a reduction and two exps
+// per key; then P·V with a lane holding 16 consecutive dims. A row's arithmetic does not depend on the other rows, so
+// drafted == serial and several streams == one hold; the bits differ from attn_decode's (another summation order).
+#define SPLIT_LK 128
+// the query heads a subgroup holds (3 of the 27B's 6: two subgroups per K/V head keep q and o in registers)
+#if Q27_GQA % 3 == 0
+#define LK_QPG 3
+#else
+#define LK_QPG 4
+#endif
+#define LK_PARTS (Q27_GQA / LK_QPG)
+#define LK_IDS                                                                                                        \
+  const int t = get_group_id(0), sp = get_group_id(1), hk = get_group_id(2) / LK_PARTS,                              \
+            lane = get_sub_group_local_id();                                                                          \
+  const int qh0 = hk * Q27_GQA + (get_group_id(2) % LK_PARTS) * LK_QPG;
+#define ATTN_LK(NAME, I8)                                                                                                   \
+KERNEL(16) void NAME(global const ushort *Q, global const ushort *KC, global const ushort *VC, global float *PM,            \
+                               global float *PL, global float *PO, int p0, int NS, float scale, global const int *TREE,     \
+                               global const ulong *MT, global const int *POS, int cap) {                                    \
+  LK_IDS                                                                                                                    \
+  int base = p0, wf = 0;                                                                                                    \
+  if (MT) {                                                                                                                 \
+    KC = (global const ushort *)MT[t * 8];                                                                                  \
+    VC = (global const ushort *)MT[t * 8 + 1];                                                                              \
+    wf = (int)MT[t * 8 + 6];                                                                                                \
+    base = TREE ? POS[wf] : 0x7fffffff;                                                                                     \
+  }                                                                                                                         \
+  const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT_LK, j1 = min(j0 + SPLIT_LK, last + 1);                      \
+  const global float *KS = (const global float *)((const global char *)KC + (long)cap * Q27_KVROW);                         \
+  const global float *VS = (const global float *)((const global char *)VC + (long)cap * Q27_KVROW);                         \
+  float q[LK_QPG][16], o[LK_QPG][16], m[LK_QPG], lp[LK_QPG];                                                            \
+  for (int a = 0; a < LK_QPG; a++) {                                                                                       \
+    for (int c = 0; c < 16; c++) q[a][c] = bf2f(Q[((long)t * Q27_AQ + qh0 + a) * 256 + c * 16 + lane]); /* dim c*16+lane */ \
+    for (int i = 0; i < 16; i++) o[a][i] = 0.0f;                                                        /* dim lane*16+i */ \
+    m[a] = -INFINITY;                                                                                                       \
+    lp[a] = 0.0f;                                                                                                           \
+  }                                                                                                                         \
+  for (int b = j0; b < j1; b += 16) {                                                                                       \
+    const int j = min(b + lane, j1 - 1); /* this lane's key (the last one again past the slice's end) */                    \
+    const long kr = j < base ? j : base + ANC(t, j - base) - wf;                                                            \
+    const long row = kr * Q27_AKV + hk;                                                                                     \
+    float s[LK_QPG];                                                                                                       \
+    for (int a = 0; a < LK_QPG; a++) s[a] = 0.0f;                                                                          \
+_Pragma("unroll")                                                                                                           \
+    for (int c = 0; c < 16; c++) {                                                                                          \
+      float16 kf;                                                                                                           \
+      if (I8)                                                                                                               \
+        kf = convert_float16(vload16(c, (const global char *)KC + row * 256));                                              \
+      else                                                                                                                  \
+        kf = as_float16(convert_uint16(vload16(c, KC + row * 256)) << 16);                                                  \
+_Pragma("unroll")                                                                                                           \
+      for (int e = 0; e < 16; e++)                                                                                          \
+_Pragma("unroll")                                                                                                           \
+        for (int a = 0; a < LK_QPG; a++) s[a] = fma(sub_group_broadcast(q[a][c], e), kf[e], s[a]);                         \
+    }                                                                                                                       \
+    const float ks = I8 ? KS[row] * scale : scale, vs = I8 ? VS[row] : 1.0f;                                                \
+    const bool ok = b + lane < j1;                                                                                          \
+    float pw[LK_QPG];                                                                                                      \
+    for (int a = 0; a < LK_QPG; a++) {                                                                                     \
+      const float sc = ok ? s[a] * ks : -INFINITY;                                                                          \
+      const float mn = fmax(m[a], sub_group_reduce_max(sc));                                                                \
+      const float al = exp(m[a] - mn), p = exp(sc - mn);                                                                    \
+      lp[a] = fma(lp[a], al, p);                                                                                            \
+      for (int i = 0; i < 16; i++) o[a][i] *= al;                                                                           \
+      m[a] = mn;                                                                                                            \
+      pw[a] = p * vs;                                                                                                       \
+    }                                                                                                                       \
+    _Pragma("unroll") /* all 16 keys: their V loads issue together; keys past the slice have pw = 0 */                      \
+    for (int k = 0; k < 16; k++) {                                                                                          \
+      const long rk = sub_group_broadcast(row, k);                                                                          \
+      float16 vf;                                                                                                           \
+      if (I8)                                                                                                               \
+        vf = convert_float16(vload16(lane, (const global char *)VC + rk * 256));                                            \
+      else                                                                                                                  \
+        vf = as_float16(convert_uint16(vload16(lane, VC + rk * 256)) << 16);                                                \
+      for (int a = 0; a < LK_QPG; a++) {                                                                                   \
+        const float pk = sub_group_broadcast(pw[a], k);                                                                     \
+        for (int i = 0; i < 16; i++) o[a][i] = fma(pk, vf[i], o[a][i]);                                                     \
+      }                                                                                                                     \
+    }                                                                                                                       \
+  }                                                                                                                         \
+  for (int a = 0; a < LK_QPG; a++) {                                                                                       \
+    const long base = ((long)t * Q27_AQ + qh0 + a) * NS + sp;                                                               \
+    const float l = sub_group_reduce_add(lp[a]);                                                                            \
+    if (lane == 0) {                                                                                                        \
+      PM[base] = m[a];                                                                                                      \
+      PL[base] = l;                                                                                                         \
+    }                                                                                                                       \
+    float16 ov;                                                                                                             \
+    for (int i = 0; i < 16; i++) ov[i] = o[a][i];                                                                           \
+    vstore16(ov, lane, PO + base * 256);                                                                                    \
+  }                                                                                                                         \
+}
+ATTN_LK(attn_decode_lk8, 1) // int8 cache (XPU_KV_INT8)
+ATTN_LK(attn_decode_lk, 0)  // bf16 cache
+
+// Ordered merge of the slices into O bf16 [T, Q27_AQ, 256]: DPL dims a lane, U slices read at once, the same bits at any.
+#define MERGE_KERNEL(NAME, DPL, U, SPL)                                                                               \
+  KERNEL(16) void NAME(global const float *PM, global const float *PL, global const float *PO, global ushort *O,     \
+                       int p0, int NS, global const int *TREE, global const int *POS) {                               \
+    const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id(), i0 = get_group_id(2) * DPL; \
+    const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPL + 1;                                                       \
+    const long base = ((long)t * Q27_AQ + hh) * NS;                                                                      \
+    float m = -INFINITY;                                                                                             \
+    for (int s = lane; s < used; s += 16) m = fmax(m, PM[base + s]);                                                 \
+    for (int x = 8; x > 0; x >>= 1) m = fmax(m, sub_group_shuffle_xor(m, x));                                        \
+    float l = 0.0f, o[DPL];                                                                                          \
+    for (int i = 0; i < DPL; i++) o[i] = 0.0f;                                                                       \
+    for (int s0 = 0; s0 < used; s0 += U) {                                                                           \
+      const int n = min(U, used - s0);                                                                               \
+      const float pm = lane < n ? PM[base + s0 + lane] : 0.0f, pl = lane < n ? PL[base + s0 + lane] : 0.0f;          \
+      float po[U][DPL];                                                                                              \
+      for (int j = 0; j < U; j++)                                                                                    \
+        for (int i = 0; i < DPL; i++) po[j][i] = j < n ? PO[(base + s0 + j) * 256 + (i0 + i) * 16 + lane] : 0.0f;    \
+      for (int j = 0; j < n; j++) {                                                                                  \
+        const float w = exp(sub_group_broadcast(pm, j) - m);                                                         \
+        l += sub_group_broadcast(pl, j) * w;                                                                         \
+        for (int i = 0; i < DPL; i++) o[i] += po[j][i] * w;                                                          \
+      }                                                                                                              \
+    }                                                                                                                \
+    for (int i = 0; i < DPL; i++) O[((long)t * Q27_AQ + hh) * 256 + (i0 + i) * 16 + lane] = f2bf(o[i] / l);              \
+  }
+MERGE_KERNEL(attn_merge, 16, 4, SPLIT) // rows of a window: a slice's 1 KB in one read
+MERGE_KERNEL(attn_merge_lk, 16, 4, SPLIT_LK)
+// One row: a subgroup per (head, 16 dims), a lane's dim summed over 16 slices read at once (written out: faster code).
+KERNEL(16) void attn_merge1(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
+                            int p0, int NS, global const int *TREE, global const int *POS) {
   const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id();
+  const int d = get_group_id(2) * 16 + lane;                   // the dimension this lane sums
   const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPLIT + 1; // non-empty slices of row t
   const long base = ((long)t * Q27_AQ + hh) * NS;
-  float m = -INFINITY;
-  for (int s = 0; s < used; s++) m = fmax(m, PM[base + s]);
-  float l = 0.0f, o[16];
-  for (int i = 0; i < 16; i++) o[i] = 0.0f;
-  for (int s = 0; s < used; s++) {
-    const float w = exp(PM[base + s] - m);
-    l += PL[base + s] * w;
-    for (int i = 0; i < 16; i++) o[i] += PO[(base + s) * 256 + i * 16 + lane] * w;
+  float m = -INFINITY;                                         // the max: the same value in any order
+  for (int s = lane; s < used; s += 16) m = fmax(m, PM[base + s]);
+  for (int x = 8; x > 0; x >>= 1) m = fmax(m, sub_group_shuffle_xor(m, x));
+  float l = 0.0f, o = 0.0f;
+  for (int s0 = 0; s0 < used; s0 += 16) {
+    const int n = min(16, used - s0);
+    const float pm = lane < n ? PM[base + s0 + lane] : 0.0f, pl = lane < n ? PL[base + s0 + lane] : 0.0f;
+    float po[16];
+    for (int j = 0; j < 16; j++) po[j] = j < n ? PO[(base + s0 + j) * 256 + d] : 0.0f;
+    for (int j = 0; j < n; j++) { // the sums in slice order
+      const float w = exp(sub_group_broadcast(pm, j) - m);
+      l += sub_group_broadcast(pl, j) * w;
+      o += po[j] * w;
+    }
   }
-  for (int i = 0; i < 16; i++) O[((long)t * Q27_AQ + hh) * 256 + i * 16 + lane] = f2bf(o[i] / l);
+  O[((long)t * Q27_AQ + hh) * 256 + d] = f2bf(o / l);
+}
+// attn_merge1 over the XPU_ATTN_LK slices
+KERNEL(16) void attn_merge1_lk(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
+                            int p0, int NS, global const int *TREE, global const int *POS) {
+  const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id();
+  const int d = get_group_id(2) * 16 + lane;                   // the dimension this lane sums
+  const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPLIT_LK + 1; // non-empty slices of row t
+  const long base = ((long)t * Q27_AQ + hh) * NS;
+  float m = -INFINITY;                                         // the max: the same value in any order
+  for (int s = lane; s < used; s += 16) m = fmax(m, PM[base + s]);
+  for (int x = 8; x > 0; x >>= 1) m = fmax(m, sub_group_shuffle_xor(m, x));
+  float l = 0.0f, o = 0.0f;
+  for (int s0 = 0; s0 < used; s0 += 16) {
+    const int n = min(16, used - s0);
+    const float pm = lane < n ? PM[base + s0 + lane] : 0.0f, pl = lane < n ? PL[base + s0 + lane] : 0.0f;
+    float po[16];
+    for (int j = 0; j < 16; j++) po[j] = j < n ? PO[(base + s0 + j) * 256 + d] : 0.0f;
+    for (int j = 0; j < n; j++) { // the sums in slice order
+      const float w = exp(sub_group_broadcast(pm, j) - m);
+      l += sub_group_broadcast(pl, j) * w;
+      o += po[j] * w;
+    }
+  }
+  O[((long)t * Q27_AQ + hh) * 256 + d] = f2bf(o / l);
 }
 
 // Commit of a kept path: its K, V rows move to positions p0 + depth in depth order, never overwriting an unread row.
