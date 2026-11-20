@@ -730,6 +730,13 @@ KERNEL(16) void attn_q8(global const ushort *Q, global ushort *Q8T, global float
   const int pe = clamp(13 - ve, -100, 100);
 
 // One step of S and the softmax for row T_ (keys b ... b + 31; m, lp, qa, qsl, vps of the row): pa[2], al[6] out.
+// XPU_ATTN_DP softmax exponentials: the hardware exp (one instruction; attn_decode_dp8 and attn_decode_dpw both use it, so
+// drafted == serial holds; DP_EXACT_EXP=1 at build time: the library exp, the bits of 592c66369)
+#ifndef DP_EXACT_EXP
+#define DP_EXP(x) native_exp(x)
+#else
+#define DP_EXP(x) exp(x)
+#endif
 #define DP_SOFTMAX(T_, J1, KRS)                                                                                        \
   int8 S[2];                                                                                                           \
   float ks[2], vs[2];                                                                                                  \
@@ -755,12 +762,12 @@ KERNEL(16) void attn_q8(global const ushort *Q, global ushort *Q8T, global float
     __attribute__((opencl_unroll_hint))                                                                                \
     for (int h = 0; h < 2; h++) sc[h][r] = ok[h] ? (float)S[h][r] * qsl[r] * ks[h] : -INFINITY;                        \
     const float mn = fmax(m[r], sub_group_reduce_max(fmax(sc[0][r], sc[1][r])));                                       \
-    al[r] = exp(m[r] - mn);                                                                                            \
+    al[r] = DP_EXP(m[r] - mn);                                                                                            \
     m[r] = mn;                                                                                                         \
   }                                                                                                                    \
   __attribute__((opencl_unroll_hint))                                                                                  \
   for (int r = 0; r < 6; r++) {                                                                                        \
-    const float q0 = exp(sc[0][r] - m[r]), q1 = exp(sc[1][r] - m[r]);                                                  \
+    const float q0 = DP_EXP(sc[0][r] - m[r]), q1 = DP_EXP(sc[1][r] - m[r]);                                                  \
     lp[r] = fma(lp[r], al[r], q0 + q1);                                                                                \
     pa[0][r] = as_short(convert_half_rte(q0 * vs[0]));                                                                 \
     pa[1][r] = as_short(convert_half_rte(q1 * vs[1]));                                                                 \
@@ -954,9 +961,9 @@ attn_decode_dpw(global const ushort *Q8T, global const float *QSL, global const 
       __attribute__((opencl_unroll_hint))
       for (int r = 0; r < 6; r++) {
         const float mn = fmax(m[r], fmax(sub_group_broadcast(mxv, r), sub_group_broadcast(mxv, 8 + r)));
-        al[r] = exp(m[r] - mn);
+        al[r] = DP_EXP(m[r] - mn);
         m[r] = mn;
-        q[r] = exp(sc[r] - mn);
+        q[r] = DP_EXP(sc[r] - mn);
         pa[r] = as_short(convert_half_rte(q[r] * vs));
       }
       pa.s6 = pa.s7 = 0;
