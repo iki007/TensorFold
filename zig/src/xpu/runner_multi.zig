@@ -100,7 +100,7 @@ pub fn verifyMulti(r: *Runner, wins: []const Win) !void {
         try ze.check(d.g.api.zeCommandListAppendMemoryCopy(d.list, a.mpos, &r.pos_host, T * 4, null, 0, null));
     }
 
-    _ = try forwardRunner(r, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi_max_pos = max_pos, .rows_out = &r.tok_host, .cand = r.candMode() });
+    _ = try forwardRunner(r, @ptrCast(r.ids_host[0..T]), 0, .{ .want = .rows, .stash = true, .taps = r.taps_on, .tree = tree, .multi_max_pos = max_pos, .multi_windows = @intCast(wins.len), .rows_out = &r.tok_host, .cand = r.candMode() });
     for (r.block[0..T], r.tok_host[0..T]) |*o, t| o.* = @intCast(t);
     for (wins, 0..) |w, i| r.multi_slots[i] = w.slot;
     r.multi_count = @intCast(wins.len);

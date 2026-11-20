@@ -131,6 +131,8 @@ pub fn chunkEnd(at: usize, len: usize) usize {
 }
 pub var MAX_CTX: u32 = 4096;
 pub const SPLIT = 32;
+pub const SPLIT_LK = 128; // XPU_ATTN_LK: keys per split (decode.cl SPLIT_LK)
+pub const LK_PARTS = 2; // XPU_ATTN_LK: subgroups per K/V head (decode.cl LK_PARTS, the 27B's 6 query heads by 3)
 pub const EPS: f32 = 1e-6;
 
 pub const ST_Q = 0;
@@ -140,7 +142,7 @@ pub const ST_G = ST_V + 16 * 48 * 128 * 2;
 pub const ST_B = ST_G + 16 * 48 * 4;
 pub const ST_P = ST_B + 16 * 48 * 4;
 pub const STASH = ST_P + 16 * GDN_IN * 2;
-pub const TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 };
+pub var TAP_LAYERS = [5]usize{ 5, 19, 33, 47, 61 }; // the drafter's target layers: DFlash2's; DSpine sets 1, 16, 31, 46, 61
 
 pub const isAttention = shape.isAttention;
 
@@ -155,6 +157,10 @@ pub var rot_on: i32 = 0;
 pub var prefill_int4 = false;
 pub var int4_sites: u32 = 8;
 pub var prefill_int8 = false;
+/// Decode attention with a key per lane (XPU_ATTN_LK, local option): attn_decode_lk(8), 128-key slices.
+pub var attn_lk = false;
+/// Decode attention on DPAS over the int8 cache (XPU_ATTN_DP, local option, with XPU_ATTN_LK and XPU_KV_INT8): attn_decode_dp8.
+pub var attn_dp = false;
 pub var a8_sites: u32 = 15;
 pub var a8_rot: i32 = 0;
 pub var a8_levels: i32 = 127;
@@ -170,6 +176,8 @@ const Options = struct {
     prefill_int4: bool,
     int4_sites: u32,
     prefill_int8: bool,
+    attn_lk: bool,
+    attn_dp: bool,
     a8_sites: u32,
     a8_rot: i32,
     a8_levels: i32,
@@ -181,7 +189,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .chunk = CHUNK, .tp = TP };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .attn_lk = attn_lk, .attn_dp = attn_dp, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .chunk = CHUNK, .tp = TP };
 }
 
 fn restore(o: Options) void {
@@ -193,6 +201,8 @@ fn restore(o: Options) void {
     prefill_int4 = o.prefill_int4;
     int4_sites = o.int4_sites;
     prefill_int8 = o.prefill_int8;
+    attn_lk = o.attn_lk;
+    attn_dp = o.attn_dp;
     a8_sites = o.a8_sites;
     a8_rot = o.a8_rot;
     a8_levels = o.a8_levels;
@@ -252,6 +262,15 @@ fn initDevKernels(d: *Dev, tp: u32) !void {
         .gdn_step = try d.kernel(md, "gdn_step", 16),
         .attn_decode = try d.kernel(md, "attn_decode", 16),
         .attn_merge = try d.kernel(md, "attn_merge", 16),
+        .attn_merge1 = try d.kernel(md, "attn_merge1", 16),
+        .attn_decode_lk = try d.kernel(md, "attn_decode_lk", 16),
+        .attn_decode_lk8 = try d.kernel(md, "attn_decode_lk8", 16),
+        .attn_decode_dp8 = try d.kernel(md, "attn_decode_dp8", 32),
+        .attn_decode_dp8x8 = try d.kernel(md, "attn_decode_dp8", 256),
+        .attn_decode_dpw = try d.kernel(md, "attn_decode_dpw", 256),
+        .attn_q8 = try d.kernel(md, "attn_q8", 16),
+        .attn_merge_lk = try d.kernel(md, "attn_merge_lk", 16),
+        .attn_merge1_lk = try d.kernel(md, "attn_merge1_lk", 16),
         .kv_move = try d.kernel(md, "kv_move", 16),
         .exl3_gemv = try d.kernel(md, "exl3_gemv", 16),
         .rot_heads = try d.kernel(mg, "rot_heads", 16),
@@ -284,7 +303,7 @@ fn initDevKernels(d: *Dev, tp: u32) !void {
         .ngen_wide = try d.kernel(mw, "w4g_dpb", 256),
         .ngen_narrow = try d.kernel(mn, "w4g_s4dpb", 256),
     };
-    for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
+    for ([_]ze.H{ d.k.attn_prep, d.k.attn_decode, d.k.attn_decode_lk, d.k.attn_decode_lk8, d.k.attn_decode_dp8, d.k.attn_decode_dp8x8, d.k.attn_decode_dpw, d.k.gdn_pre, d.k.gdn_step }) |k| try d.g.indirect(k);
 }
 
 pub const Runner = struct {
@@ -373,6 +392,8 @@ pub const Runner = struct {
 
         if (std.c.getenv("XPU_DUMP")) |v| dump_dir = std.mem.span(v);
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
+        if (std.c.getenv("XPU_ATTN_LK") != null) attn_lk = true;
+        if (std.c.getenv("XPU_ATTN_DP") != null) attn_dp = true;
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
         if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
         if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
@@ -594,4 +615,5 @@ test "every open starts from the process's options, and a second runner is refus
 test {
     _ = @import("prompt_tail.zig");
     _ = @import("runner_drain_test.zig");
+    _ = @import("drafter_tree.zig");
 }

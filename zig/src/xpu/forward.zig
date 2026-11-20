@@ -15,7 +15,6 @@ const SPLIT = q.SPLIT;
 const limits = @import("limits.zig");
 const cand = @import("cand.zig");
 const tail = @import("prompt_tail.zig");
-const TAP_LAYERS = q.TAP_LAYERS;
 const VOCAB = q.VOCAB;
 const alloc = q.alloc;
 extern "c" fn close(fd: c_int) c_int;
@@ -43,6 +42,8 @@ pub const Acts = struct {
     pm: *anyopaque,
     pl: *anyopaque,
     po: *anyopaque,
+    q8: *anyopaque, // XPU_ATTN_DP: the decode queries in int8, A tiles [16, Q27_AKV, 8, 8, 16] u16 …
+    qsl: *anyopaque, // … and their scales times the attention scale fp32 [16, Q27_AQ]
     pscr: *anyopaque, // fp32 [maxRows, D]
     logits: *anyopaque, // rank 0: fp16 [16, VOCAB] (peers: minimal stub)
     shard_logits: *anyopaque, // TP>1: fp16 [16, vocab_len]
@@ -99,6 +100,8 @@ pub const Acts = struct {
             .pm = try d.alloc_(16 * @as(usize, sh.aq) * ns * 4),
             .pl = try d.alloc_(16 * @as(usize, sh.aq) * ns * 4),
             .po = try d.alloc_(16 * @as(usize, sh.aq) * ns * 256 * 4),
+            .q8 = try d.alloc_(16 * @as(usize, sh.akv) * 1024 * 2),
+            .qsl = try d.alloc_(16 * @as(usize, sh.aq) * 4),
             .pscr = try d.alloc_(rows * D * 4),
             .logits = try d.alloc_(if (rank == 0) 16 * VOCAB * 2 else 64),
             .shard_logits = try d.alloc_(if (q.TP > 1) 16 * @as(usize, vocab_len) * 2 else 64),
@@ -260,7 +263,7 @@ pub const Want = tail.Want;
 
 comptime {
     if (LAYERS != tail.layers) @compileError("xpu/prompt_tail.zig's layer count does not match qwen27.zig");
-    for (TAP_LAYERS) |tl| if (tl == LAYERS - 1) @compileError("the XPU prompt tail assumes the last layer is not tapped");
+    // the drafter sets q.TAP_LAYERS when it loads (DSpine): forward keeps a tapped layer whole (`tapped`)
 }
 
 fn atRows(a: *const Acts, base: usize, sh: q.TpShape) Acts {
@@ -315,7 +318,7 @@ pub fn a8(d: *Dev, a: *Acts, x: *anyopaque, K: u32, T: u32, site: u32) !void {
 pub var gemm_probe: ?*const fn (*Dev, *Acts, Proj, *anyopaque, u32, usize, u32) anyerror!void = null;
 pub var gdn_probe: ?*const fn (*Dev, *Acts, *anyopaque, u32, usize) anyerror!void = null;
 
-pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi_max_pos: ?u32 = null, rows_out: ?*[16]i32 = null, cand: ?cand.Mode = null };
+pub const Mode = struct { prompt: bool = false, want: Want = .last, stash: bool = false, taps: bool = false, tree: bool = false, multi_max_pos: ?u32 = null, multi_windows: u32 = 0, rows_out: ?*[16]i32 = null, cand: ?cand.Mode = null };
 
 /// Multi-GPU TP={1,2,4} forward over `ids` (< q.maxRows() rows) at p0..; returns last row's greedy token.
 pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 {
@@ -361,7 +364,7 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
 
     for (0..LAYERS) |i| {
         const is_attn = q.isAttention(i);
-        const tapped = mode.taps and std.mem.indexOfScalar(usize, &TAP_LAYERS, i) != null;
+        const tapped = mode.taps and std.mem.indexOfScalar(usize, &q.TAP_LAYERS, i) != null;
         const plan = if (mode.prompt and is_attn) tail.tailPlan(T, mode.want, i, tail_hooks or tapped) else tail.Plan.all;
         const kv_only = plan == .kv_only;
 
@@ -417,6 +420,19 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
                     try d.launch(d.k.attn_prompt8, .{ .x = (wr + 7) / 8, .y = sh.akv }, .{ wa.q, l.kc.?, l.vc.?, wa.y, @as(i32, @intCast(ap0)), @as(i32, @intCast(wr)), @as(f32, 1.0 / 16.0), kvCap() });
                 } else if (wide) {
                     try d.launch(d.k.attn_prompt, .{ .x = (wr + 7) / 8, .y = sh.akv }, .{ wa.q, l.kc.?, l.vc.?, wa.y, @as(i32, @intCast(ap0)), @as(i32, @intCast(wr)), @as(f32, 1.0 / 16.0) });
+                } else if (q.attn_lk and tp == 1) { // XPU_ATTN_LK: a key per lane, 128-key slices, 2 subgroups per K/V head
+                    const nl = (ctx + q.SPLIT_LK - 1) / q.SPLIT_LK;
+                    // the rows of one cache (one stream, or one window of a shared round) share a step's work (dpw)
+                    const one_cache = if (mode.multi_max_pos != null) mode.multi_windows == 1 else true;
+                    const tree_arg = if (mode.multi_max_pos != null) tree else table;
+                    if (q.attn_dp and q.kv_i8) { // XPU_ATTN_DP: DPAS, int8 queries made once a layer
+                        try d.launch(d.k.attn_q8, .{ .x = T, .y = 4, .z = 1 }, .{ a.q, a.q8, a.qsl, @as(f32, 1.0 / 16.0) });
+                        if (T > 1 and one_cache) // 8 rows a group sharing a step's work
+                            try d.launch(d.k.attn_decode_dpw, .{ .x = (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32, @as(i32, if (mode.tree) 1 else 0) })
+                        else // a group of 1 or 8 rows (each its own)
+                            try d.launch(if (T == 1) d.k.attn_decode_dp8 else d.k.attn_decode_dp8x8, .{ .x = if (T == 1) 1 else (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32 });
+                    } else try d.launch(if (q.kv_i8) d.k.attn_decode_lk8 else d.k.attn_decode_lk, .{ .x = T * q.LK_PARTS, .y = nl, .z = 4 }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), @as(f32, 1.0 / 16.0), if (mode.multi_max_pos != null) tree else table, mt, mpos, kvCap() });
+                    try d.launch(if (T == 1) d.k.attn_merge1_lk else d.k.attn_merge_lk, .{ .x = 24, .y = T, .z = if (T == 1) 16 else 1 }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), table, mpos });
                 } else {
                     try d.launch(d.k.attn_decode, .{ .x = ns, .y = sh.akv, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi_max_pos != null) tree else table, mt, mpos, kvCap() });
                     try d.launch(d.k.attn_merge, .{ .x = sh.aq, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });
@@ -505,7 +521,7 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
             try dump(&r.d, &r.acts, T, try std.fmt.bufPrint(&buff, "{d}", .{i}), true);
         }
 
-        if (mode.taps) for (TAP_LAYERS, 0..) |tl, slot| if (tl == i) {
+        if (mode.taps) for (q.TAP_LAYERS, 0..) |tl, slot| if (tl == i) {
             try r.d.launch(r.d.k.tap, .{ .x = D / 256, .y = T }, .{ r.acts.x, r.acts.r, r.acts.taps, @as(i32, D), @as(i32, @intCast(slot)) });
         };
     }

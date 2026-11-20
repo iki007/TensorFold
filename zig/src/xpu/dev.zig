@@ -96,6 +96,15 @@ pub const Dev = struct {
         gdn_step: ze.H,
         attn_decode: ze.H,
         attn_merge: ze.H,
+        attn_merge1: ze.H,
+        attn_decode_lk: ze.H, // XPU_ATTN_LK (decode.cl): bf16 and int8 caches, their merges
+        attn_decode_lk8: ze.H,
+        attn_decode_dp8: ze.H, // XPU_ATTN_DP (decode.cl): one row a group, and 8 rows a group (dp8x8)
+        attn_decode_dp8x8: ze.H,
+        attn_decode_dpw: ze.H, // XPU_ATTN_DP, several rows of one cache: the same bits, the work of 8 rows shared
+        attn_q8: ze.H, // XPU_ATTN_DP: the queries in int8, once a layer
+        attn_merge_lk: ze.H,
+        attn_merge1_lk: ze.H,
         kv_move: ze.H,
         exl3_gemv: ze.H,
         rot_heads: ze.H,
@@ -223,8 +232,8 @@ pub const Prof = struct {
     events: [4096]ze.H = @splat(null),
     kernel: [4096]ze.H = @splat(null),
     used: usize = 0,
-    names: [64]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
-    total: [64]f64 = @splat(0),
+    names: [128]struct { k: ze.H = null, name: []const u8 = "" } = @splat(.{}),
+    total: [128]f64 = @splat(0),
 };
 
 pub fn profReport(label: []const u8) void {

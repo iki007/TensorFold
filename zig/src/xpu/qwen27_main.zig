@@ -3,12 +3,16 @@ const std = @import("std");
 const q = @import("qwen27.zig");
 const dr_mod = @import("drafter.zig");
 const Drafter = dr_mod.Drafter;
+const dtree = @import("drafter_tree.zig");
 const fp64_ref = @import("fp64_ref.zig");
 
 const alloc = std.heap.c_allocator;
 extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
 extern "c" fn lseek(fd: c_int, off: i64, whence: c_int) i64;
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) ?*anyopaque;
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fwrite(p: *const anyopaque, size: usize, n: usize, f: *anyopaque) usize;
+extern "c" fn fclose(f: *anyopaque) c_int;
 
 pub fn main(init: std.process.Init) !void {
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -52,6 +56,8 @@ pub fn main(init: std.process.Init) !void {
     q.profReport("decode");
     if (std.c.getenv("XPU_OVERLAP_PROBE") != null) try overlapProbe(r);
     if (std.c.getenv("XPU_ROWS_PROBE") != null) try rowsProbe(r);
+    if (std.c.getenv("XPU_DEPTH_PROBE")) |v| try depthProbe(r, std.mem.span(v));
+    if (std.c.getenv("XPU_LOGITS_PROBE")) |v| try logitsProbe(r, ids.items, std.mem.span(v));
     if (std.c.getenv("XPU_EXL3_PROBE") != null) try exl3Probe(r);
     if (std.c.getenv("XPU_MULTI_TEST")) |v| try multiTest(r, ids.items, try std.fmt.parseInt(u32, std.mem.span(v), 10));
     if (std.c.getenv("XPU_GEMM_ZEBIN")) |path| try gemmLoop(r, std.mem.span(path));
@@ -102,12 +108,12 @@ fn onTaps(ctx: *anyopaque, taps: *anyopaque, n: u32) !void {
     try dr.addTaps(taps, n);
 }
 
-/// Greedy decode with DFlash2 drafts (blocks of XPU_BLOCK rows, 8 by default): must equal the serial reply.
+/// Greedy decode with DFlash2 drafts (blocks of XPU_BLOCK rows, 16 by default): must equal the serial reply.
 fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u32) !void {
     const t_load = q.now();
     const dr = try Drafter.init(r, dir);
     std.debug.print("drafter loaded in {d:.1} s\n", .{q.now() - t_load});
-    const L: u32 = if (std.c.getenv("XPU_BLOCK")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 8;
+    const L: u32 = if (std.c.getenv("XPU_BLOCK")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 16;
     try r.reset();
     dr.reset();
     r.taps_on = true;
@@ -119,6 +125,8 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     q.profReport("drafter prompt (discarded)");
     var t_draft: f64 = 0;
     var t_verify: f64 = 0;
+    var phases: [4]f64 = @splat(0);
+    if (std.c.getenv("XPU_ROUND_TIMES") != null) dtree.phase_times = &phases;
     const t0 = q.now();
     const nodes: u32 = if (std.c.getenv("XPU_TREE")) |v| try std.fmt.parseInt(u32, std.mem.span(v), 10) else 0;
     var accepted: usize = 0;
@@ -157,6 +165,10 @@ fn drafted(r: *q.Runner, dir: []const u8, prompt: []const u32, serial: []const u
     const len = @min(got.items.len, serial.len);
     const same = std.mem.eql(u32, got.items[0..len], serial[0..len]);
     std.debug.print("drafted: {d} tokens in {d} rounds ({d:.2} a round), {d:.1} tok/s, draft {d:.1} ms + verify {d:.1} ms a round, equal to serial: {}\n", .{ got.items.len - 1, rounds, @as(f64, @floatFromInt(got.items.len - 1)) / @as(f64, @floatFromInt(rounds)), @as(f64, @floatFromInt(got.items.len - 1)) / dt, t_draft * 1e3 / @as(f64, @floatFromInt(rounds)), t_verify * 1e3 / @as(f64, @floatFromInt(rounds)), same });
+    if (dtree.phase_times != null) {
+        const per = 1e3 / @as(f64, @floatFromInt(rounds));
+        std.debug.print("round phases (ms a round): lattice {d:.2}, tree {d:.2}, verify {d:.2}, commit {d:.2}\n", .{ phases[0] * per, phases[1] * per, phases[2] * per, phases[3] * per });
+    }
 }
 
 /// Can a prompt GEMM and the chunked GDN of another chunk share the card? Times each alone, chained, and unordered.
@@ -256,6 +268,60 @@ fn a8Loop(r: *q.Runner, path: []const u8) !void {
     const dt = (q.now() - t0) / 2000;
     const ops = 2.0 * @as(f64, @floatFromInt(T)) * @as(f64, @floatFromInt(w.n)) * @as(f64, @floatFromInt(w.k));
     std.debug.print("a8 loop {s} {s} (N {d}, K {d}): {d:.3} ms a call, {d:.1} TOPS\n", .{ path, which, w.n, w.k, dt * 1e3, ops / dt / 1e12 });
+}
+
+/// Decode cost at a context depth without filling it (XPU_DEPTH_PROBE=65536,131072,...; XPU_CTX must hold the deepest):
+/// the position jumps to each depth and 16 one-row steps (best of them) and 4 verify blocks of 16 rows are timed. The
+/// rows past the prompt hold no keys, so the tokens mean nothing; the kernels do the same work as at that depth.
+/// XPU_LOGITS_PROBE=PATH (local probe): the prompt but its last 16 ids, then those 16 as one verified block (PATH.verify)
+/// and as 16 steps (PATH.serial): fp32 logits, 16 rows each.
+fn logitsProbe(r: *q.Runner, ids: []const u32, path: []const u8) !void {
+    if (ids.len <= 16) return error.ShortPrompt;
+    const n = ids.len - 16;
+    for ([_][]const u8{ "verify", "serial" }) |kind| {
+        try r.reset();
+        try r.prompt(ids[0..n], true);
+        const name = try std.fmt.allocPrintSentinel(alloc, "{s}.{s}", .{ path, kind }, 0);
+        defer alloc.free(name);
+        const f = fopen(name.ptr, "wb") orelse return error.OpenFailed;
+        defer _ = fclose(f);
+        if (kind[0] == 'v') _ = try r.verify(ids[n..]);
+        for (0..16) |j| {
+            if (kind[0] == 's') try r.step(ids[n + j]);
+            const lg = try r.rowLogits(if (kind[0] == 'v') @intCast(j) else 0);
+            if (fwrite(lg.ptr, 4, lg.len, f) != lg.len) return error.WriteFailed;
+        }
+        if (kind[0] == 'v') r.block_rows = 0;
+    }
+    std.debug.print("logits probe: {d} + 16 rows written to {s}.verify / .serial\n", .{ n, path });
+}
+
+fn depthProbe(r: *q.Runner, list: []const u8) !void {
+    var it = std.mem.tokenizeScalar(u8, list, ',');
+    var ids: [16]u32 = undefined;
+    for (&ids, 0..) |*x, i| x.* = @intCast(1000 + i);
+    while (it.next()) |w| {
+        const depth = try std.fmt.parseInt(u32, w, 10);
+        var best: f64 = 1e9;
+        q.profReport("depth probe (discarded)");
+        for (0..16) |_| {
+            r.pos = depth;
+            const t0 = q.now();
+            try r.step(1000);
+            best = @min(best, q.now() - t0);
+        }
+        q.profReport("depth probe, one row");
+        var best16: f64 = 1e9;
+        for (0..4) |_| {
+            r.pos = depth;
+            const t0 = q.now();
+            _ = try r.verify(&ids);
+            best16 = @min(best16, q.now() - t0);
+            r.block_rows = 0;
+        }
+        q.profReport("depth probe, 16 rows");
+        std.debug.print("depth probe: {d:6} one row {d:6.2} ms, 16 rows {d:6.2} ms\n", .{ depth, best * 1e3, best16 * 1e3 });
+    }
 }
 
 /// Multi-stream estimate: the cost of one forward of T rows (1 to 16) as a verification block; the state is left as is.

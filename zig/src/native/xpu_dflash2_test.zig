@@ -90,7 +90,10 @@ pub const Host = struct {
     pub const max_slots = 4;
     pub const tap_row = ROW;
     pub const draft_step_ms = 0.6;
-    pub const tap_layers = [_]u32{ 5, 19, 33, 47, 61 };
+    const tap_layers = [_]u32{ 5, 19, 33, 47, 61 };
+    pub fn tapLayers() []const u32 {
+        return &tap_layers;
+    }
     block: u32 = 8,
     nodes: u32 = 15,
     owners: [4]?*Stream = @splat(null),
