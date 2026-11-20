@@ -154,6 +154,14 @@ KERNEL(16) void attn_decode(global const ushort *Q, global const ushort *KC, glo
 // per key; then P·V with a lane holding 16 consecutive dims. A row's arithmetic does not depend on the other rows, so
 // drafted == serial and several streams == one hold; the bits differ from attn_decode's (another summation order).
 #define SPLIT_LK 128
+// XPU_ATTN_SPAN (tgt > 0): a row of n = last + 1 keys reads them in slices of SPLIT_LK * 2^k keys, 2^k the largest
+// power of two <= n / (SPLIT_LK * tgt) (at least 1, at most 256), so a row has at most 2 tgt slices whatever its depth:
+// fewer partials to write and merge. It depends on the row's own keys only (drafted == serial holds); tgt 0: SPLIT_LK.
+static inline int lk_span(int last, int tgt) {
+  if (tgt <= 0) return SPLIT_LK;
+  const int a = (last + 1) / (SPLIT_LK * tgt);
+  return a <= 1 ? SPLIT_LK : SPLIT_LK << min(31 - (int)clz(a), 8);
+}
 // the query heads a subgroup holds (3 of the 27B's 6: two subgroups per K/V head keep q and o in registers)
 #if Q27_GQA % 3 == 0
 #define LK_QPG 3
@@ -249,11 +257,13 @@ ATTN_LK(attn_decode_lk8, 1) // int8 cache (XPU_KV_INT8)
 ATTN_LK(attn_decode_lk, 0)  // bf16 cache
 
 // Ordered merge of the slices into O bf16 [T, Q27_AQ, 256]: DPL dims a lane, U slices read at once, the same bits at any.
-#define MERGE_KERNEL(NAME, DPL, U, SPL)                                                                               \
+#define MERGE_TGT , int tgt
+#define MERGE_KERNEL(NAME, DPL, U, SPL) MERGE_KERNEL_X(NAME, DPL, U, SPL, )
+#define MERGE_KERNEL_X(NAME, DPL, U, SPL, EXTRA)                                                                     \
   KERNEL(16) void NAME(global const float *PM, global const float *PL, global const float *PO, global ushort *O,     \
-                       int p0, int NS, global const int *TREE, global const int *POS) {                               \
+                       int p0, int NS, global const int *TREE, global const int *POS EXTRA) {                         \
     const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id(), i0 = get_group_id(2) * DPL; \
-    const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPL + 1;                                                       \
+    const int last = POS ? POS[t] : p0 + DEPTH(t), used = last / (SPL) + 1;                                          \
     const long base = ((long)t * Q27_AQ + hh) * NS;                                                                      \
     float m = -INFINITY;                                                                                             \
     for (int s = lane; s < used; s += 16) m = fmax(m, PM[base + s]);                                                 \
@@ -275,7 +285,7 @@ ATTN_LK(attn_decode_lk, 0)  // bf16 cache
     for (int i = 0; i < DPL; i++) O[((long)t * Q27_AQ + hh) * 256 + (i0 + i) * 16 + lane] = f2bf(o[i] / l);              \
   }
 MERGE_KERNEL(attn_merge, 16, 4, SPLIT) // rows of a window: a slice's 1 KB in one read
-MERGE_KERNEL(attn_merge_lk, 16, 4, SPLIT_LK)
+MERGE_KERNEL_X(attn_merge_lk, 16, 4, lk_span(last, tgt), MERGE_TGT)
 // One row: a subgroup per (head, 16 dims), a lane's dim summed over 16 slices read at once (written out: faster code).
 KERNEL(16) void attn_merge1(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
                             int p0, int NS, global const int *TREE, global const int *POS) {
@@ -302,10 +312,10 @@ KERNEL(16) void attn_merge1(global const float *PM, global const float *PL, glob
 }
 // attn_merge1 over the XPU_ATTN_LK slices
 KERNEL(16) void attn_merge1_lk(global const float *PM, global const float *PL, global const float *PO, global ushort *O,
-                            int p0, int NS, global const int *TREE, global const int *POS) {
+                            int p0, int NS, global const int *TREE, global const int *POS, int tgt) {
   const int hh = get_group_id(0), t = get_group_id(1), lane = get_sub_group_local_id();
   const int d = get_group_id(2) * 16 + lane;                   // the dimension this lane sums
-  const int used = (POS ? POS[t] : p0 + DEPTH(t)) / SPLIT_LK + 1; // non-empty slices of row t
+  const int last = POS ? POS[t] : p0 + DEPTH(t), used = last / lk_span(last, tgt) + 1; // non-empty slices of row t
   const long base = ((long)t * Q27_AQ + hh) * NS;
   float m = -INFINITY;                                         // the max: the same value in any order
   for (int s = lane; s < used; s += 16) m = fmax(m, PM[base + s]);
@@ -762,7 +772,7 @@ KERNEL(16) void attn_q8(global const ushort *Q, global ushort *Q8T, global float
 __attribute__((intel_reqd_sub_group_size(16))) kernel void attn_decode_dp8(
     global const ushort *Q8T, global const float *QSL, global const ushort *KC, global const ushort *VC,
     global float *PM, global float *PL, global float *PO, int p0, int NS, global const int *TREE,
-    global const ulong *MT, global const int *POS, int cap, int T) {
+    global const ulong *MT, global const int *POS, int cap, int T, int tgt) {
   const int sg = get_sub_group_id(), lane = get_sub_group_local_id(), part = sg & 1;
   const int t = get_group_id(0) * (int)(get_num_sub_groups() / 2) + sg / 2, sp = get_group_id(1), hk = get_group_id(2);
   if (t >= T) return;
@@ -773,8 +783,8 @@ __attribute__((intel_reqd_sub_group_size(16))) kernel void attn_decode_dp8(
     wf = (int)MT[t * 8 + 6];
     base = TREE ? POS[wf] : 0x7fffffff;
   }
-  const int last = MT ? POS[t] : p0 + DEPTH(t), j0 = sp * SPLIT_LK, j1 = min(j0 + SPLIT_LK, last + 1);
-  if (j0 >= j1) return; // the merges read slices 0 ... last / SPLIT_LK only
+  const int last = MT ? POS[t] : p0 + DEPTH(t), span = lk_span(last, tgt), j0 = sp * span, j1 = min(j0 + span, last + 1);
+  if (j0 >= j1) return; // the merges read slices 0 ... last / span only
   const global char *K8 = (const global char *)KC, *V8 = (const global char *)VC;
   const global float *KS = (const global float *)(K8 + (long)cap * Q27_KVROW);
   const global float *VS = (const global float *)(V8 + (long)cap * Q27_KVROW);
@@ -797,10 +807,12 @@ __attribute__((intel_reqd_sub_group_size(16))) kernel void attn_decode_dp8(
     short8 pa[2];
     float al[6];
     DP_SOFTMAX(t, j1, )
-    __attribute__((opencl_unroll_hint))
-    for (int e = 0; e < 8; e++)
+    // the rescale only when a head's max moved (al == 1: o * 1 == o, the same bits); al is the same in every lane
+    if (al[0] != 1.0f || al[1] != 1.0f || al[2] != 1.0f || al[3] != 1.0f || al[4] != 1.0f || al[5] != 1.0f)
       __attribute__((opencl_unroll_hint))
-      for (int r = 0; r < 6; r++) o[e][r] *= al[r];
+      for (int e = 0; e < 8; e++)
+        __attribute__((opencl_unroll_hint))
+        for (int r = 0; r < 6; r++) o[e][r] *= al[r];
     const long rowk0 = (long)(min(b + lane, j1 - 1) < base ? min(b + lane, j1 - 1) : base + ANC(t, min(b + lane, j1 - 1) - base) - wf) * Q27_AKV + hk;
     const long rowk1 = (long)(min(b + 16 + lane, j1 - 1) < base ? min(b + 16 + lane, j1 - 1) : base + ANC(t, min(b + 16 + lane, j1 - 1) - base) - wf) * Q27_AKV + hk;
     __attribute__((opencl_unroll_hint))
@@ -851,7 +863,7 @@ static inline uint dp_pair(uint lo, uint hi) { // lo, hi: the int8 values in the
 __attribute__((intel_reqd_sub_group_size(16))) __attribute__((reqd_work_group_size(256, 1, 1))) kernel void
 attn_decode_dpw(global const ushort *Q8T, global const float *QSL, global const ushort *KC, global const ushort *VC,
                 global float *PM, global float *PL, global float *PO, int p0, int NS, global const int *TREE,
-                global const ulong *MT, global const int *POS, int cap, int T, int tree) {
+                global const ulong *MT, global const int *POS, int cap, int T, int tree, int tgt) {
   local float MX[2][8][16];      // a tile's maxima by step parity, row: tile 0 heads 0-7, tile 1 heads 0-7
   local float QV[2][8][6][16];   // tile 1's p, for the row's sums (kept by its tile 0 subgroup)
   local ushort PA[2][8][2][128]; // A tiles of P (row r = head r, lane = key)
@@ -864,13 +876,17 @@ attn_decode_dpw(global const ushort *Q8T, global const float *QSL, global const 
     KC = (global const ushort *)MT[r0 * 8];
     VC = (global const ushort *)MT[r0 * 8 + 1];
   }
-  const int wf = MT ? (int)MT[r0 * 8 + 6] : 0, base = MT ? (TREE ? POS[wf] : 0x7fffffff) : p0, j0 = sp * SPLIT_LK;
+  const int wf = MT ? (int)MT[r0 * 8 + 6] : 0, base = MT ? (TREE ? POS[wf] : 0x7fffffff) : p0;
+  int lmax = 0; // the rows share one span (the host's condition): the deepest row's
+  __attribute__((opencl_unroll_hint))
+  for (int i = 0; i < 8; i++) lmax = r0 + i < T ? max(lmax, MT ? POS[r0 + i] : p0 + DEPTH(r0 + i)) : lmax;
+  const int span = lk_span(lmax, tgt), j0 = sp * span;
   int jend[8], jmax = j0, j1 = j0; // the rows' key ends in this slice (j0: the row reads none of it)
   __attribute__((opencl_unroll_hint))
   for (int i = 0; i < 8; i++) {
     const int t = r0 + i;
     const int last = t < T ? (MT ? POS[t] : p0 + DEPTH(t)) : -1;
-    jend[i] = max(j0, min(j0 + SPLIT_LK, last + 1));
+    jend[i] = max(j0, min(j0 + span, last + 1));
     jmax = max(jmax, jend[i]);
     j1 = i == tr ? jend[i] : j1;
   }

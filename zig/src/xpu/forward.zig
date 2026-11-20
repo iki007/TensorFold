@@ -421,18 +421,25 @@ pub fn forwardRunner(r: *q.Runner, ids: []const i32, p0: u32, mode: Mode) !?i32 
                 } else if (wide) {
                     try d.launch(d.k.attn_prompt, .{ .x = (wr + 7) / 8, .y = sh.akv }, .{ wa.q, l.kc.?, l.vc.?, wa.y, @as(i32, @intCast(ap0)), @as(i32, @intCast(wr)), @as(f32, 1.0 / 16.0) });
                 } else if (q.attn_lk and tp == 1) { // XPU_ATTN_LK: a key per lane, 128-key slices, 2 subgroups per K/V head
-                    const nl = (ctx + q.SPLIT_LK - 1) / q.SPLIT_LK;
-                    // the rows of one cache (one stream, or one window of a shared round) share a step's work (dpw)
-                    const one_cache = if (mode.multi_max_pos != null) mode.multi_windows == 1 else true;
+                    // XPU_ATTN_SPAN: slices of lk_span keys (DP path; the LK kernels keep SPLIT_LK), at most 2 tgt a row
+                    const tgt: u32 = if (q.attn_dp and q.kv_i8) q.attn_span else 0;
+                    const nl_lk = (ctx + q.SPLIT_LK - 1) / q.SPLIT_LK;
+                    const nl = if (tgt > 0) @min(nl_lk, 2 * tgt) else nl_lk;
+                    // the rows of one cache (one stream, or one window of a shared round) share a step's work (dpw),
+                    // when they also share one slice size (rows straddling a size change take dp8x8, row by row)
+                    const last_hi: u32 = @intCast(ctx - 1);
+                    const last_lo: u32 = if (mode.multi_max_pos) |mp| mp -| @as(u32, @intCast(T - 1)) else @intCast(p0);
+                    const one_span = q.lkSpan(last_lo, tgt) == q.lkSpan(last_hi, tgt);
+                    const one_cache = (if (mode.multi_max_pos != null) mode.multi_windows == 1 else true) and one_span;
                     const tree_arg = if (mode.multi_max_pos != null) tree else table;
                     if (q.attn_dp and q.kv_i8) { // XPU_ATTN_DP: DPAS, int8 queries made once a layer
                         try d.launch(d.k.attn_q8, .{ .x = T, .y = 4, .z = 1 }, .{ a.q, a.q8, a.qsl, @as(f32, 1.0 / 16.0) });
                         if (T > 1 and one_cache) // 8 rows a group sharing a step's work
-                            try d.launch(d.k.attn_decode_dpw, .{ .x = (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32, @as(i32, if (mode.tree) 1 else 0) })
+                            try d.launch(d.k.attn_decode_dpw, .{ .x = (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32, @as(i32, if (mode.tree) 1 else 0), @as(i32, @intCast(tgt)) })
                         else // a group of 1 or 8 rows (each its own)
-                            try d.launch(if (T == 1) d.k.attn_decode_dp8 else d.k.attn_decode_dp8x8, .{ .x = if (T == 1) 1 else (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32 });
+                            try d.launch(if (T == 1) d.k.attn_decode_dp8 else d.k.attn_decode_dp8x8, .{ .x = if (T == 1) 1 else (T + 7) / 8, .y = nl, .z = 4 }, .{ a.q8, a.qsl, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), tree_arg, mt, mpos, kvCap(), t32, @as(i32, @intCast(tgt)) });
                     } else try d.launch(if (q.kv_i8) d.k.attn_decode_lk8 else d.k.attn_decode_lk, .{ .x = T * q.LK_PARTS, .y = nl, .z = 4 }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), @as(f32, 1.0 / 16.0), if (mode.multi_max_pos != null) tree else table, mt, mpos, kvCap() });
-                    try d.launch(if (T == 1) d.k.attn_merge1_lk else d.k.attn_merge_lk, .{ .x = 24, .y = T, .z = if (T == 1) 16 else 1 }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), table, mpos });
+                    try d.launch(if (T == 1) d.k.attn_merge1_lk else d.k.attn_merge_lk, .{ .x = 24, .y = T, .z = if (T == 1) 16 else 1 }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(nl)), table, mpos, @as(i32, @intCast(tgt)) });
                 } else {
                     try d.launch(d.k.attn_decode, .{ .x = ns, .y = sh.akv, .z = T }, .{ a.q, l.kc.?, l.vc.?, a.pm, a.pl, a.po, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), @as(f32, 1.0 / 16.0), if (mode.multi_max_pos != null) tree else table, mt, mpos, kvCap() });
                     try d.launch(d.k.attn_merge, .{ .x = sh.aq, .y = T }, .{ a.pm, a.pl, a.po, a.y, @as(i32, @intCast(p0)), @as(i32, @intCast(ns)), table, mpos });

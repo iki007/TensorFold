@@ -161,6 +161,17 @@ pub var prefill_int8 = false;
 pub var attn_lk = false;
 /// Decode attention on DPAS over the int8 cache (XPU_ATTN_DP, local option, with XPU_ATTN_LK and XPU_KV_INT8): attn_decode_dp8.
 pub var attn_dp = false;
+/// XPU_ATTN_SPAN=N (local option, with XPU_ATTN_DP): a row reads its keys in at most 2 N slices (decode.cl lk_span), 0 =
+/// slices of SPLIT_LK keys at any depth. Fewer partials for the verify blocks at depth.
+pub var attn_span: u32 = 0;
+/// decode.cl lk_span: the keys a slice of a row whose last key is `last`.
+pub fn lkSpan(last: u32, tgt: u32) u32 {
+    if (tgt == 0) return SPLIT_LK;
+    const a = (last + 1) / (SPLIT_LK * tgt);
+    if (a <= 1) return SPLIT_LK;
+    const k: u5 = @intCast(@min(31 - @clz(a), 8));
+    return @as(u32, SPLIT_LK) << k;
+}
 pub var a8_sites: u32 = 15;
 pub var a8_rot: i32 = 0;
 pub var a8_levels: i32 = 127;
@@ -178,6 +189,7 @@ const Options = struct {
     prefill_int8: bool,
     attn_lk: bool,
     attn_dp: bool,
+    attn_span: u32,
     a8_sites: u32,
     a8_rot: i32,
     a8_levels: i32,
@@ -189,7 +201,7 @@ var defaults: ?Options = null;
 var live = false;
 
 fn options() Options {
-    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .attn_lk = attn_lk, .attn_dp = attn_dp, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .chunk = CHUNK, .tp = TP };
+    return .{ .dump_dir = dump_dir, .dump_h = dump_h, .a8_group = a8_group, .kv8 = kv8, .kv_i8 = kv_i8, .prefill_int4 = prefill_int4, .int4_sites = int4_sites, .prefill_int8 = prefill_int8, .attn_lk = attn_lk, .attn_dp = attn_dp, .attn_span = attn_span, .a8_sites = a8_sites, .a8_rot = a8_rot, .a8_levels = a8_levels, .a8_sites4 = a8_sites4, .chunk = CHUNK, .tp = TP };
 }
 
 fn restore(o: Options) void {
@@ -203,6 +215,7 @@ fn restore(o: Options) void {
     prefill_int8 = o.prefill_int8;
     attn_lk = o.attn_lk;
     attn_dp = o.attn_dp;
+    attn_span = o.attn_span;
     a8_sites = o.a8_sites;
     a8_rot = o.a8_rot;
     a8_levels = o.a8_levels;
@@ -394,6 +407,7 @@ pub const Runner = struct {
         if (std.c.getenv("XPU_PREFILL_INT8") != null) prefill_int8 = true;
         if (std.c.getenv("XPU_ATTN_LK") != null) attn_lk = true;
         if (std.c.getenv("XPU_ATTN_DP") != null) attn_dp = true;
+        if (std.c.getenv("XPU_ATTN_SPAN")) |v| attn_span = try std.fmt.parseInt(u32, std.mem.span(v), 10);
         if (std.c.getenv("XPU_KV_INT8") != null) kv_i8 = true;
         if (std.c.getenv("XPU_PREFILL_INT4") != null) prefill_int4 = true;
         if (std.c.getenv("XPU_PREFILL_INT4_SITES")) |v| int4_sites = try std.fmt.parseInt(u32, std.mem.span(v), 10);
